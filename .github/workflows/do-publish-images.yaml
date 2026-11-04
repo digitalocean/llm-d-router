@@ -1,0 +1,129 @@
+name: DO - Publish Images and Charts
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_REGISTRY: ghcr.io/digitalocean/llm-d-router
+
+jobs:
+  build-and-push:
+    if: github.repository == 'digitalocean/llm-d-router'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: endpoint-picker
+            dockerfile: Dockerfile.epp
+          - image: disagg-sidecar
+            dockerfile: Dockerfile.sidecar
+          - image: coordinator
+            dockerfile: Dockerfile.coordinator
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      # Branch names such as feat/foo are not valid image tags.
+      - name: Compute tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
+
+      - name: Build AMD64 image (no push)
+        uses: ./.github/actions/docker-build-and-push
+        with:
+          docker-file: ${{ matrix.dockerfile }}
+          tag: ${{ steps.tag.outputs.tag }}
+          image-name: ${{ matrix.image }}
+          registry: ${{ env.IMAGE_REGISTRY }}
+          push: 'false'
+          buildx-outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Run Trivy scan on AMD64
+        uses: ./.github/actions/trivy-scan
+        with:
+          tarball: /tmp/image.tar
+
+      # prerelease: 'true' suppresses the floating :latest tag.
+      - name: Push image for both AMD64 and ARM64
+        id: push
+        uses: ./.github/actions/docker-build-and-push
+        with:
+          docker-file: ${{ matrix.dockerfile }}
+          tag: ${{ steps.tag.outputs.tag }}
+          image-name: ${{ matrix.image }}
+          registry: ${{ env.IMAGE_REGISTRY }}
+          github-token: ${{ github.token }}
+          prerelease: 'true'
+          commit-sha: ${{ github.sha }}
+          push: 'true'
+
+      - name: Attest image provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE_REGISTRY }}/${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  push-helm-charts:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        chart:
+          - llm-d-router-standalone
+          - llm-d-router-gateway
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # hack/push-chart.sh only rewrites the EPP image for semver tags, so a
+      # branch build would otherwise ship upstream's ghcr.io/llm-d image.
+      - name: Point chart at this commit's EPP image
+        env:
+          CHART: ${{ matrix.chart }}
+        run: |
+          yq -i '
+            .router.epp.image.registry = strenv(IMAGE_REGISTRY) |
+            .router.epp.image.repository = "endpoint-picker" |
+            .router.epp.image.tag = strenv(GITHUB_SHA) |
+            .router.epp.image.pullPolicy = "IfNotPresent"' \
+            "config/charts/${CHART}/values.yaml"
+
+      # Charts land at oci://$IMAGE_REGISTRY/charts/<chart> under a floating
+      # version (0.0.0-main) and an immutable per-commit one (0.0.0-main-<sha>).
+      - name: Package and push charts
+        env:
+          CHART: ${{ matrix.chart }}
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          for version in "0.0.0-${ref}" "0.0.0-${ref}-${GITHUB_SHA::12}"; do
+            CHART_VERSION="${version}" make helm-push CHART="${CHART}" EXTRA_TAG="${ref}"
+          done
