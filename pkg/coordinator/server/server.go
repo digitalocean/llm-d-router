@@ -33,7 +33,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	sglangapiv1 "github.com/llm-d/llm-d-router/pkg/common/grpc/sglang/gen/apiv1"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 
@@ -114,8 +113,11 @@ func otelHandler(next http.Handler) http.Handler {
 }
 
 func isServedInferencePath(cleanPath string) bool {
-	return reqcommon.DetectAPIType(cleanPath).Path() == cleanPath ||
-		cleanPath == sglangapiv1.SglangService_Generate_FullMethodName
+	if reqcommon.DetectAPIType(cleanPath).Path() == cleanPath {
+		return true
+	}
+	_, ok := lookupGRPCRoute(cleanPath)
+	return ok
 }
 
 // canonicalizeInferencePath rewrites a POST whose path, cleaned by path.Clean,
@@ -179,9 +181,22 @@ type RouteRegistrar interface {
 	RegisterRoutes(r chi.Router)
 }
 
+// Option configures optional Server settings at construction time.
+type Option func(*Server)
+
+// WithWorkerProtocol sets the worker protocol ("http" or "grpc") used by the
+// server when deciding whether HTTP POST /inference/v1/generate translates to
+// vllm.Inference gRPC worker legs.
+func WithWorkerProtocol(protocol string) Option {
+	return func(s *Server) {
+		s.workerProtocol = protocol
+	}
+}
+
 type Server struct {
 	httpServer         *http.Server
 	pipeline           *pipeline.Pipeline
+	workerProtocol     string
 	maxRequestBodySize int64
 	passthrough        *passthroughHandler
 	secureServing      bool
@@ -190,7 +205,7 @@ type Server struct {
 	draining           atomic.Bool
 }
 
-func New(cfg config.ServerConfig, p *pipeline.Pipeline, gwClient *gateway.Client) (*Server, error) {
+func New(cfg config.ServerConfig, p *pipeline.Pipeline, gwClient *gateway.Client, opts ...Option) (*Server, error) {
 	maxBodySize := cfg.MaxRequestBodySize
 	if maxBodySize == 0 {
 		// Zero means unset; Viper fills this from the config default in
@@ -217,11 +232,23 @@ func New(cfg config.ServerConfig, p *pipeline.Pipeline, gwClient *gateway.Client
 	}
 	s := &Server{
 		pipeline:           p,
+		workerProtocol:     config.WorkerProtocolHTTP,
 		maxRequestBodySize: maxBodySize,
 		passthrough:        passthrough,
 		secureServing:      cfg.SecureServing,
 		certPath:           cfg.CertPath,
 		tls:                profile,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	if err := config.ValidateWorkerProtocol(s.workerProtocol); err != nil {
+		return nil, fmt.Errorf("server: %w", err)
+	}
+	if s.workerProtocol == "" {
+		s.workerProtocol = config.WorkerProtocolHTTP
 	}
 
 	r := chi.NewRouter()
@@ -240,7 +267,12 @@ func New(cfg config.ServerConfig, p *pipeline.Pipeline, gwClient *gateway.Client
 	r.Post(reqcommon.PathMessages, s.handleInference)
 	r.Post(reqcommon.PathVLLMGenerate, s.handleInference)
 	// r.Post(reqcommon.PathSGLangGenerate, s.handleInference)
-	r.Post(sglangapiv1.SglangService_Generate_FullMethodName, s.handleSGLangGRPC)
+	for _, gr := range grpcRoutes {
+		scan := gr.scan
+		r.Post(gr.path, func(w http.ResponseWriter, req *http.Request) {
+			s.serveGRPC(w, req, scan)
+		})
+	}
 	r.Get(pathHealthz, s.handleHealth)
 	r.Get(pathReadyz, s.handleReady)
 	r.NotFound(s.passthrough.ServeHTTP)
@@ -252,10 +284,9 @@ func New(cfg config.ServerConfig, p *pipeline.Pipeline, gwClient *gateway.Client
 	}
 
 	s.httpServer = &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      s.closeWhenDraining(otelHandler(r)),
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
+		Addr:        cfg.ListenAddr,
+		Handler:     s.closeWhenDraining(otelHandler(r)),
+		ReadTimeout: cfg.ReadTimeout,
 	}
 	if !cfg.SecureServing {
 		protocols := new(http.Protocols)
@@ -312,12 +343,45 @@ func (s *Server) StartDrain() {
 // net/http's HTTP/2 server turns that header into a GOAWAY.
 func (s *Server) closeWhenDraining(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.draining.Load() {
-			w.Header().Set("Connection", "close")
-		}
-		next.ServeHTTP(w, r)
+		dw := &drainResponseWriter{ResponseWriter: w, draining: &s.draining}
+		next.ServeHTTP(dw, r)
+		dw.WriteHeader(http.StatusOK)
 	})
 }
+
+type drainResponseWriter struct {
+	http.ResponseWriter
+	draining    *atomic.Bool
+	wroteHeader bool
+}
+
+func (w *drainResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	// Non-101 informational responses leave final headers uncommitted and must not carry Connection: close.
+	w.wroteHeader = status >= http.StatusOK || status == http.StatusSwitchingProtocols
+	if w.wroteHeader && status != http.StatusSwitchingProtocols && w.draining.Load() {
+		w.Header().Set("Connection", "close")
+	}
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *drainResponseWriter) Write(p []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *drainResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *drainResponseWriter) FlushError() error {
+	w.WriteHeader(http.StatusOK)
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *drainResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
