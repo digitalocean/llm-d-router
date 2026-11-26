@@ -257,7 +257,9 @@ kubectl wait --for=jsonpath='{.subsets[0].addresses[0].ip}' \
 | `router.epp.crossReplica.publishTimeout` | Timeout shared by contributors for one endpoint publication or deletion. Must be positive. | `1s` |
 | `router.epp.crossReplica.redis.address` | External Redis `host:port`; required when synchronization is enabled. | `""` |
 | `router.epp.crossReplica.redis.db` | Redis database number. Use a separate database or server for unrelated routing pools. | `0` |
-| `router.epp.crossReplica.redis.stateTTL` | Expiration of each replica's endpoint state in Redis. Must exceed the observed successful per-endpoint refresh interval with margin for Redis latency; minimum `1ms`. | `2s` |
+| `router.epp.crossReplica.redis.stateTTL` | Expiration of every kind of synced state in Redis. Must exceed the observed successful per-endpoint refresh interval with margin for Redis latency; minimum `1ms`. | `2s` |
+| `router.epp.crossReplica.redis.inflightStateTTL` | Expiration of a replica's in-flight load and budget accounting values. Empty keeps them on `stateTTL`. Minimum `1ms`. | `""` |
+| `router.epp.crossReplica.redis.prefixStateTTL` | Expiration of a replica's prefix windows and their streams. Empty keeps them on `stateTTL`. Raise it above `stateTTL` to let a restarted replica restore prefix state. Minimum `1ms`. | `""` |
 | `router.epp.crossReplica.redis.coordinationTTL` | Request-level coordination value expiration; minimum `1ms`. | `180s` |
 | `router.epp.crossReplica.redis.passwordSecretRef` | Existing Secret reference with `name` and `key`, exposed through the plugin's `passwordEnv`. | `{}` |
 | `router.epp.deploymentStrategy` | Overrides the EPP Deployment's `spec.strategy`. Defaults to `RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1` for `haMode: all-active`, cross-replica sync, or autoscaling; otherwise `{type: Recreate}`. See [Multi-replica EPP and Helm `--wait`](#multi-replica-epp-and-helm---wait). | Mode-dependent |

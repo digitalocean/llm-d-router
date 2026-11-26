@@ -20,6 +20,8 @@ plugins:
       address: my-router-redis:6379
       passwordFile: /var/run/secrets/redis/password
       stateTTL: 2s
+      inflightStateTTL: 2s
+      prefixStateTTL: 10m
       coordinationTTL: 180s
 
 dataLayer:
@@ -37,8 +39,16 @@ Parameters:
   `passwordEnv` and `passwordFile` are mutually exclusive. Plaintext
   `password` configuration is rejected.
 - `db`: Redis database number. Defaults to `0`.
-- `stateTTL`: Expiration for each replica's endpoint state in Redis. Defaults to
-  `2s` and must be at least `1ms`.
+- `stateTTL`: Expiration for every kind of synced state in Redis. Defaults to
+  `2s` and must be at least `1ms`. It remains the single expiry unless
+  `inflightStateTTL` or `prefixStateTTL` overrides it, so a configuration that
+  sets only `stateTTL` behaves as before the TTLs were split.
+- `inflightStateTTL`: Expiration for a replica's in-flight load and budget
+  accounting values. Defaults to `stateTTL` when it is set; otherwise to `2s`.
+  Must be at least `1ms`.
+- `prefixStateTTL`: Expiration for a replica's prefix windows and their streams.
+  Defaults to `stateTTL` when it is set; otherwise to `10m`. Must be at least
+  `1ms`.
 - `coordinationTTL`: Expiration for request-level coordination values. Defaults
   to `180s` and must be at least `1ms`.
 - `windowReplication`: How sequenced values such as approximate-prefix windows
@@ -64,9 +74,9 @@ syncer once per contributor per cycle with the live endpoint set, without
 holding its endpoint lock, and each chunk runs under one `publishTimeout`. Syncers without batch
 support visit endpoints sequentially, with concurrent contributor writes for
 each endpoint. Endpoints removed while a batch runs are deleted again after
-it finishes. A slow cycle can exceed `syncInterval`. Choose `stateTTL` longer
-than the observed interval between successful refreshes of an endpoint, with
-margin for Redis latency and variation in cycle duration.
+it finishes. A slow cycle can exceed `syncInterval`. Choose `inflightStateTTL`
+longer than the observed interval between successful refreshes of an endpoint,
+with margin for Redis latency and variation in cycle duration.
 
 Deletion waits for the publisher's write lock, then starts one timeout shared by
 all contributor deletions. An earlier caller deadline takes precedence for both
@@ -107,6 +117,24 @@ replaces it. A replica that stops publishing loses its field `stateTTL` after
 its last write, and the next refresh drops it from the aggregate. `Get` reads
 the cache without accessing Redis and combines it with the contributor's live
 local value. If no peer value is available, `Get` returns the local value.
+
+The expiry depends on what a field holds, because the two kinds of synced state
+have different costs:
+
+| Kind | Values | Default TTL |
+|---|---|---|
+| In-flight accounting | Anything that is not a sequenced value, such as `inflight-load-producer`'s request and token counts. | `inflightStateTTL`, `2s` |
+| Prefix windows | Sequenced values such as `approximate-prefix-cache-producer`'s window, including the hash field and the Redis stream beside it. | `prefixStateTTL`, `10m` |
+
+The short accounting TTL bounds how long a crashed replica's in-flight load
+counts against its peers; at `syncInterval: 200ms`, `2s` is ten publication
+cycles, so a live replica always refreshes well before expiry, and a dead one
+drops out within a few seconds. The long prefix TTL is what lets state outlive
+a replica process, because a prefix window is expensive to rebuild from traffic.
+
+Both per-kind parameters fall back to `stateTTL` when it is set and they are
+not, so a configuration that sets `stateTTL` alone expires every kind of state
+on that TTL, exactly as before the split.
 
 ### Incremental replication
 

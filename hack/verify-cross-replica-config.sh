@@ -146,6 +146,8 @@ EOF
       render "${values[@]}" "${sync[@]}" \
         --set router.epp.crossReplica.redis.db=4 \
         --set router.epp.crossReplica.redis.stateTTL=5s \
+        --set router.epp.crossReplica.redis.inflightStateTTL=3s \
+        --set router.epp.crossReplica.redis.prefixStateTTL=15m \
         --set router.epp.crossReplica.redis.coordinationTTL=60s \
         --set router.epp.crossReplica.syncInterval=100ms \
         --set router.epp.crossReplica.publishTimeout=500ms \
@@ -156,7 +158,7 @@ EOF
       diff -u "${TEMP_DIR}/other-before.json" "${TEMP_DIR}/other-after.json"
       assert_yaml "${config}" '(.dataLayer.crossReplica | sort_keys(..) | to_json) == ({"publishTimeout": "500ms", "syncInterval": "100ms", "syncerPluginRef": "redis-syncer"} | sort_keys(..) | to_json)'
       assert_yaml "${config}" '[.plugins[] | select(.type == "redis-syncer")] | length == 1'
-      assert_yaml "${config}" '.plugins[] | select(.type == "redis-syncer") | (.parameters | sort_keys(..) | to_json) == ({"address": "redis.example:6379", "coordinationTTL": "60s", "db": 4, "passwordEnv": "EPP_REDIS_PASSWORD", "stateTTL": "5s"} | sort_keys(..) | to_json)'
+      assert_yaml "${config}" '.plugins[] | select(.type == "redis-syncer") | (.parameters | sort_keys(..) | to_json) == ({"address": "redis.example:6379", "coordinationTTL": "60s", "db": 4, "inflightStateTTL": "3s", "passwordEnv": "EPP_REDIS_PASSWORD", "prefixStateTTL": "15m", "stateTTL": "5s"} | sort_keys(..) | to_json)'
       assert_yaml "${deployment}" '.spec.template.spec.containers[] | select(.name == "epp") | .env[] | select(.name == "EPP_REDIS_PASSWORD") | (.valueFrom.secretKeyRef | sort_keys(..) | to_json) == ({"key": "password", "name": "redis-auth"} | sort_keys(..) | to_json)'
       # Compare all original fields, allowing the generated dataLayer container.
       "${YQ}" -o=json 'del(.dataLayer.crossReplica) | .plugins |= map(select(.type != "redis-syncer")) | sort_keys(..)' "${config}" > "${TEMP_DIR}/after.yaml"

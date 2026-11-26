@@ -40,11 +40,22 @@ import (
 )
 
 const (
-	RedisSyncerType        = "redis-syncer"
-	defaultAddress         = "localhost:6379"
+	RedisSyncerType = "redis-syncer"
+	defaultAddress  = "localhost:6379"
+	// defaultCoordinationTTL is how long request-level coordination values stay.
 	defaultCoordinationTTL = 180 * time.Second
-	batchSize              = 100
-	batchConcurrency       = 8
+	// defaultInflightStateTTL is how long a replica's in-flight load and budget
+	// accounting count after its last refresh when inflightStateTTL is unset and
+	// stateTTL is not configured either. It matches DefaultStateTTL: a crashed
+	// replica's load drops out within a few sync ticks.
+	defaultInflightStateTTL = crossreplica.DefaultStateTTL
+	// defaultPrefixStateTTL is how long a replica's prefix windows stay in Valkey
+	// after its last refresh when prefixStateTTL is unset and stateTTL is not
+	// configured either. Prefix windows are expensive to rebuild from traffic and
+	// cheap to keep, so they outlive the per-replica accounting values.
+	defaultPrefixStateTTL = 10 * time.Minute
+	batchSize             = 100
+	batchConcurrency      = 8
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
@@ -57,6 +68,8 @@ type redisConfig struct {
 	PasswordFile      string `json:"passwordFile"`
 	DB                int    `json:"db"`
 	StateTTL          string `json:"stateTTL"`
+	InflightStateTTL  string `json:"inflightStateTTL"`
+	PrefixStateTTL    string `json:"prefixStateTTL"`
 	CoordinationTTL   string `json:"coordinationTTL"`
 	WindowReplication string `json:"windowReplication"`
 	MaxBytesPerSecond int64  `json:"maxBytesPerSecond"`
@@ -67,10 +80,19 @@ type redisConfig struct {
 // it with the live local value. Only a successful Set replaces the aggregate, so
 // while Redis is unreachable the last known peer state keeps counting.
 type RedisSyncer struct {
-	typedName       fwkplugin.TypedName
-	replicaID       string
-	client          *goredis.Client
-	stateTTL        time.Duration
+	typedName fwkplugin.TypedName
+	replicaID string
+	client    *goredis.Client
+	// stateTTL expires every kind of synced state. It is the only TTL unless
+	// inflightStateTTL or prefixStateTTL override it, which keeps a
+	// configuration that sets stateTTL alone behaving as before the split.
+	stateTTL time.Duration
+	// inflightStateTTL expires per-replica load and budget-accounting values, so
+	// a crashed replica's in-flight load drops out within a couple of sync ticks.
+	inflightStateTTL time.Duration
+	// prefixStateTTL expires prefix windows. They are expensive to rebuild from
+	// traffic, so they outlive the accounting values by design.
+	prefixStateTTL  time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
 	// peerGauges keeps activePeers and peerIndexEntries in step with cache.
@@ -82,6 +104,34 @@ type RedisSyncer struct {
 	epochs        atomic.Uint64
 	publishBudget *byteBudget
 	readBudget    *byteBudget
+}
+
+// inflightTTL is the TTL for whole values such as in-flight load and budget
+// accounting. A zero inflightStateTTL falls back to stateTTL.
+func (s *RedisSyncer) inflightTTL() time.Duration {
+	if s.inflightStateTTL > 0 {
+		return s.inflightStateTTL
+	}
+	return s.stateTTL
+}
+
+// prefixTTL is the TTL for prefix windows and their streams. A zero
+// prefixStateTTL falls back to stateTTL.
+func (s *RedisSyncer) prefixTTL() time.Duration {
+	if s.prefixStateTTL > 0 {
+		return s.prefixStateTTL
+	}
+	return s.stateTTL
+}
+
+// valueTTL is the TTL for a published value: prefix windows outlive accounting
+// values. Sequenced values are the prefix windows; every other synced value is
+// per-replica accounting.
+func (s *RedisSyncer) valueTTL(value any) time.Duration {
+	if _, ok := value.(fwkdl.SequencedValue); ok {
+		return s.prefixTTL()
+	}
+	return s.inflightTTL()
 }
 
 type aggregateCacheEntry struct {
@@ -109,6 +159,18 @@ func parseTTL(name, raw string, defaultValue time.Duration) (time.Duration, erro
 		return 0, fmt.Errorf("redis-syncer: %s must be at least %s, got %s", name, crossreplica.MinimumDuration, ttl)
 	}
 	return ttl, nil
+}
+
+// resolveKindTTL parses one per-kind TTL. An unset per-kind parameter falls back
+// to stateTTL when the configuration sets it, so a configuration that sets only
+// stateTTL expires every kind of state on that TTL exactly as before the kinds
+// were split. Otherwise it takes the kind's own default.
+func resolveKindTTL(name, raw string, stateTTL time.Duration, stateTTLSet bool, defaultValue time.Duration) (time.Duration, error) {
+	fallback := defaultValue
+	if stateTTLSet {
+		fallback = stateTTL
+	}
+	return parseTTL(name, raw, fallback)
 }
 
 func resolvePassword(cfg redisConfig) (string, error) {
@@ -148,6 +210,14 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	}
 
 	stateTTL, err := parseTTL("stateTTL", cfg.StateTTL, crossreplica.DefaultStateTTL)
+	if err != nil {
+		return nil, err
+	}
+	inflightStateTTL, err := resolveKindTTL("inflightStateTTL", cfg.InflightStateTTL, stateTTL, cfg.StateTTL != "", defaultInflightStateTTL)
+	if err != nil {
+		return nil, err
+	}
+	prefixStateTTL, err := resolveKindTTL("prefixStateTTL", cfg.PrefixStateTTL, stateTTL, cfg.StateTTL != "", defaultPrefixStateTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -200,15 +270,17 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	valkeyUp.Set(0)
 
 	return &RedisSyncer{
-		typedName:       fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
-		replicaID:       replicaID,
-		client:          client,
-		stateTTL:        stateTTL,
-		coordinationTTL: coordinationTTL,
-		peerGauges:      newPeerGauges(),
-		incremental:     incremental,
-		publishBudget:   newByteBudget(cfg.MaxBytesPerSecond),
-		readBudget:      newByteBudget(cfg.MaxBytesPerSecond),
+		typedName:        fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
+		replicaID:        replicaID,
+		client:           client,
+		stateTTL:         stateTTL,
+		inflightStateTTL: inflightStateTTL,
+		prefixStateTTL:   prefixStateTTL,
+		coordinationTTL:  coordinationTTL,
+		peerGauges:       newPeerGauges(),
+		incremental:      incremental,
+		publishBudget:    newByteBudget(cfg.MaxBytesPerSecond),
+		readBudget:       newByteBudget(cfg.MaxBytesPerSecond),
 	}, nil
 }
 
@@ -236,10 +308,11 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 	}
 
 	hashKey := s.hashKey(key, endpointID)
+	ttl := s.valueTTL(value)
 	pipe := s.client.TxPipeline()
 	pipe.HSet(ctx, hashKey, s.replicaID, data)
-	pipe.HPExpire(ctx, hashKey, s.stateTTL, s.replicaID)
-	pipe.PExpire(ctx, hashKey, s.stateTTL)
+	pipe.HPExpire(ctx, hashKey, ttl, s.replicaID)
+	pipe.PExpire(ctx, hashKey, ttl)
 	result := pipe.HGetAll(ctx, hashKey)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("redis-syncer: set and get aggregate; Redis 7.4 or newer with HPEXPIRE is required: %w", err)
@@ -396,10 +469,11 @@ func (s *RedisSyncer) publishChunk(ctx context.Context, key fwkdl.StateKey, aggr
 				failures[endpointID] = fmt.Errorf("redis-syncer: encode: %w", err)
 				continue
 			}
+			ttl := s.valueTTL(value)
 			pub.commands = []goredis.Cmder{
 				pipe.HSet(ctx, pub.hashKey, s.replicaID, data),
-				pipe.HPExpire(ctx, pub.hashKey, s.stateTTL, s.replicaID),
-				pipe.PExpire(ctx, pub.hashKey, s.stateTTL),
+				pipe.HPExpire(ctx, pub.hashKey, ttl, s.replicaID),
+				pipe.PExpire(ctx, pub.hashKey, ttl),
 			}
 		}
 		pub.result = pipe.HGetAll(ctx, pub.hashKey)
