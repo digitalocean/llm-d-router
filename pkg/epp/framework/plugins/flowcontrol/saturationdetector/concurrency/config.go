@@ -18,6 +18,7 @@ limitations under the License.
 package concurrency
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -79,6 +80,37 @@ type apiConfig struct {
 	MaxTokenConcurrency      *int64 `json:"maxTokenConcurrency,omitempty"`
 	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
 
+	// DynamicBudget controls whether MaxConcurrency and MaxTokenConcurrency are
+	// divided across the active EPP replicas. Valid values are:
+	//
+	//   - "off" (default): the full limit applies on every replica, so N active
+	//     replicas can together admit N times the limit.
+	//   - "onPeerLoss": the full limit applies while the cross-replica syncer
+	//     reports fresh peer values, and the limit is divided while peer values
+	//     are missing or stale. Use this when the detector reads an in-flight
+	//     load the syncer already aggregates across replicas: the aggregate
+	//     covers the deployment, so dividing it as well would halve capacity.
+	//   - "always": always divide, which is only correct against load that
+	//     excludes peers, such as a producer with syncCrossReplicaState: false.
+	//     Rejected at startup when the in-flight producer syncs across replicas
+	//     and a syncer is configured.
+	//
+	// A JSON bool is accepted for compatibility: true means "always".
+	DynamicBudget *budgetMode `json:"dynamicBudget,omitempty"`
+
+	// BudgetOversubscription scales the per-replica share computed when
+	// DynamicBudget divides the limit, to tolerate uneven load across replicas.
+	// 1.0 keeps the shares adding up to exactly the deployment-wide limit.
+	//
+	// Defaults to 1.0 if unset.
+	BudgetOversubscription *float64 `json:"budgetOversubscription,omitempty"`
+
+	// ExpectedReplicas is the replica count the limit is divided by before the
+	// cross-replica syncer reports one, such as during a cold start. With a
+	// syncer that reports no count and no expected count, the limit is not
+	// divided. Zero or unset leaves it unknown.
+	ExpectedReplicas *int `json:"expectedReplicas,omitempty"`
+
 	// FailOpen controls the scheduling filter when every candidate endpoint is over its limit.
 	//
 	// When true, the filter returns all candidates and the scorers pick the least loaded one.
@@ -101,6 +133,40 @@ const (
 	modeHybrid concurrencyMode = "hybrid"
 )
 
+// budgetMode is how the flow-control limits are divided across replicas.
+type budgetMode string
+
+const (
+	// budgetOff keeps the full deployment-wide limit on every replica.
+	budgetOff budgetMode = "off"
+	// budgetAlways always divides the limit by the replica count. Only correct
+	// against in-flight load that excludes peers.
+	budgetAlways budgetMode = "always"
+	// budgetOnPeerLoss divides the limit only while peer values are missing or
+	// stale, and keeps the full limit while they are fresh.
+	budgetOnPeerLoss budgetMode = "onPeerLoss"
+)
+
+// UnmarshalJSON accepts the mode string, and a JSON bool for compatibility,
+// where true means budgetAlways.
+func (m *budgetMode) UnmarshalJSON(data []byte) error {
+	var enabled bool
+	if err := json.Unmarshal(data, &enabled); err == nil {
+		if enabled {
+			*m = budgetAlways
+		} else {
+			*m = budgetOff
+		}
+		return nil
+	}
+	var mode string
+	if err := json.Unmarshal(data, &mode); err != nil {
+		return fmt.Errorf("dynamicBudget must be a mode string or a bool: %w", err)
+	}
+	*m = budgetMode(mode)
+	return nil
+}
+
 const (
 	// defaultMaxConcurrency is the safe baseline for many LLM serving engines.
 	defaultMaxConcurrency int64 = 100
@@ -112,6 +178,11 @@ const (
 	defaultMaxTokenConcurrency int64 = 1000000
 	// defaultFailOpen is used when FailOpen is unset.
 	defaultFailOpen = true
+	// defaultBudgetMode keeps the full deployment-wide limit on every replica.
+	defaultBudgetMode = budgetOff
+	// defaultBudgetOversubscription keeps the per-replica shares adding up to
+	// exactly the deployment-wide limit.
+	defaultBudgetOversubscription = 1.0
 )
 
 // config is the internal, fully-validated configuration used by the detector.
@@ -123,6 +194,17 @@ type config struct {
 	inFlightLoadProducerName string
 	// failClosed makes the filter return no endpoints when every candidate is over its limit.
 	failClosed bool
+	// budgetMode decides whether the limits are divided across replicas.
+	budgetMode budgetMode
+	// budgetOversubscription scales each replica's share of the limits.
+	budgetOversubscription float64
+	// expectedReplicas divides the limits before the replica count is known.
+	expectedReplicas int
+}
+
+// dividesBudget reports whether the configured mode ever divides the limit.
+func (c config) dividesBudget() bool {
+	return c.budgetMode == budgetAlways || c.budgetMode == budgetOnPeerLoss
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -147,7 +229,19 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
 		inFlightLoadProducerName: safeCfg.InFlightLoadProducerName,
 		failClosed:               !*safeCfg.FailOpen,
+		budgetMode:               *safeCfg.DynamicBudget,
+		budgetOversubscription:   *safeCfg.BudgetOversubscription,
+		expectedReplicas:         coldStartReplicas(&safeCfg),
 	}, nil
+}
+
+// coldStartReplicas returns the configured cold-start replica count, or zero
+// when unset.
+func coldStartReplicas(cfg *apiConfig) int {
+	if cfg.ExpectedReplicas == nil {
+		return 0
+	}
+	return *cfg.ExpectedReplicas
 }
 
 // applyDefaults populates unset fields in the external configuration with their standard defaults.
@@ -166,6 +260,12 @@ func applyDefaults(cfg *apiConfig) {
 	}
 	if cfg.FailOpen == nil {
 		cfg.FailOpen = ptr.To(defaultFailOpen)
+	}
+	if cfg.DynamicBudget == nil {
+		cfg.DynamicBudget = ptr.To(defaultBudgetMode)
+	}
+	if cfg.BudgetOversubscription == nil {
+		cfg.BudgetOversubscription = ptr.To(defaultBudgetOversubscription)
 	}
 }
 
@@ -191,6 +291,23 @@ func validateConfig(cfg *apiConfig) error {
 		default:
 			errs = append(errs, fmt.Errorf("unsupported concurrencyMode: %q", *cfg.ConcurrencyMode))
 		}
+	}
+
+	if cfg.DynamicBudget != nil {
+		switch *cfg.DynamicBudget {
+		case budgetOff, budgetAlways, budgetOnPeerLoss:
+			// Valid
+		default:
+			errs = append(errs, fmt.Errorf("unsupported dynamicBudget %q, want one of %s|%s|%s or a bool",
+				*cfg.DynamicBudget, budgetOff, budgetAlways, budgetOnPeerLoss))
+		}
+	}
+
+	if cfg.BudgetOversubscription != nil && !(*cfg.BudgetOversubscription > 0.0) {
+		errs = append(errs, fmt.Errorf("budgetOversubscription must be strictly positive, got %f", *cfg.BudgetOversubscription))
+	}
+	if cfg.ExpectedReplicas != nil && *cfg.ExpectedReplicas < 0 {
+		errs = append(errs, fmt.Errorf("expectedReplicas must be non-negative, got %d", *cfg.ExpectedReplicas))
 	}
 
 	return errors.Join(errs...)

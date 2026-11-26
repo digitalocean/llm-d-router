@@ -573,6 +573,7 @@ func decodeEntries(msgs []goredis.XMessage, from, tip uint64) (uint64, [][]byte,
 func (s *RedisSyncer) storeStreamAggregate(key fwkdl.StateKey, read *streamRead, aggregate func([]any) any) int {
 	hashKey := read.pub.hashKey
 	peers := len(read.next) + len(read.legacy)
+	s.observeReplicas(hashKey, read.pub.result.Val())
 	if peers == 0 {
 		s.storeAggregate(key, hashKey, nil)
 		return 0

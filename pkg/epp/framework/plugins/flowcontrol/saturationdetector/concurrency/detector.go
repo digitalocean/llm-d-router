@@ -37,6 +37,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
+	inflightloadconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/inflightload/constants"
 )
 
 const (
@@ -59,7 +60,22 @@ func ConcurrencyDetectorFactory(
 	if err != nil {
 		return nil, err
 	}
-	return newDetector(name, *cfg, log.FromContext(handle.Context())), nil
+	detector := newDetector(name, *cfg, log.FromContext(handle.Context()))
+	detector.setHandle(handle)
+	if handle != nil && handle.Metrics() != nil {
+		if err := registerBudgetMetrics(handle.Metrics()); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.dividesBudget() && handle != nil {
+		// The cross-replica syncer is added to the handle after plugins are
+		// instantiated, so the replica count and the peer-load check are
+		// resolved on first use. See resolveBudget.
+		detector.budget.setSource(&handleBudgetSource{handle: handle})
+	} else {
+		recordStaticBudget(name, *cfg)
+	}
+	return detector, nil
 }
 
 var (
@@ -72,10 +88,21 @@ var (
 type detector struct {
 	config                       config
 	typedName                    fwkplugin.TypedName
+	logger                       logr.Logger
 	inFlightLoadDataKey          fwkplugin.DataKey
 	uncachedRequestTokensDataKey fwkplugin.DataKey
 	dispatchReservations         sync.Map
 	pendingDispatches            atomic.Int64
+	// budget decides the limits this replica enforces. Nil when the configured
+	// mode never divides them, so the configured limits apply unchanged.
+	budget *replicaBudget
+	// handle is read once, on the first evaluation, to see whether the in-flight
+	// load this detector reads includes peers.
+	handle fwkplugin.Handle
+	// inFlightProducerName is the name the detector resolves on the handle to
+	// read that producer's cross-replica configuration.
+	inFlightProducerName string
+	budgetOnce           sync.Once
 }
 
 // newDetector creates a new instance of the Concurrency Detector.
@@ -91,7 +118,8 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 		"maxConcurrency", cfg.maxConcurrency,
 		"maxTokenConcurrency", cfg.maxTokenConcurrency,
 		"headroom", cfg.headroom,
-		"failOpen", !cfg.failClosed)
+		"failOpen", !cfg.failClosed,
+		"dynamicBudget", cfg.budgetMode)
 
 	if cfg.headroom > 1.0 {
 		pluginLogger.Info("Unusually high headroom configured; verify value is a fraction, not a percentage",
@@ -99,12 +127,120 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 			"effectiveBurst", fmt.Sprintf("%.0f%%", cfg.headroom*100))
 	}
 
-	return &detector{
+	producerName := cfg.inFlightLoadProducerName
+	if producerName == "" {
+		// Unset selects the unnamed instance, which the loader names after its
+		// type, the same name the data key defaults to.
+		producerName = inflightloadconstants.InFlightLoadProducerType
+	}
+	d := &detector{
 		config:                       cfg,
 		typedName:                    typedName,
+		logger:                       pluginLogger,
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
 		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		inFlightProducerName:         producerName,
 	}
+	if cfg.dividesBudget() {
+		d.budget = newReplicaBudget(cfg, name, pluginLogger)
+	}
+	return d
+}
+
+// setHandle supplies the plugin handle the budget resolves the syncer and the
+// in-flight producer from.
+func (d *detector) setHandle(handle fwkplugin.Handle) {
+	d.handle = handle
+}
+
+// budgetLabel is the value of the detector label on the budget gauges.
+func (d *detector) budgetLabel() string {
+	return d.typedName.Name
+}
+
+// limits returns the request and token limits this replica enforces.
+func (d *detector) limits() (requests, tokens int64) {
+	if d.budget == nil {
+		return d.config.maxConcurrency, d.config.maxTokenConcurrency
+	}
+	d.budgetOnce.Do(d.resolveBudget)
+	return d.budget.limits()
+}
+
+// resolveBudget settles, once, whether this detector's mode is safe for the
+// in-flight load it reads, and how that load relates to peers.
+//
+// A producer that leaves syncCrossReplicaState at its default publishes its
+// load to the syncer, which adds every replica's load to the value this
+// detector reads. That value then already covers the deployment, so its limit
+// must not be divided as well. Two consequences:
+//
+//   - budgetAlways is only correct against load that excludes peers. With a
+//     synced producer and a configured syncer it would halve real capacity, so
+//     it falls back to the full limit and logs once. Neither the syncer nor an
+//     auto-created producer is on the handle when the factory runs, so this is
+//     the earliest the check can happen.
+//   - budgetOnPeerLoss divides only when peer values are stale, which only
+//     means something if the load includes them. Against a local producer it
+//     has no peer values to lose, so it divides unconditionally like
+//     budgetAlways.
+func (d *detector) resolveBudget() {
+	syncsPeers, known := d.inFlightLoadSyncsPeers()
+	if !known {
+		// The producer is not on the handle yet. Assume the common case, a
+		// synced producer, so the limit stays divided and peer freshness is
+		// required; the load is local until the producer exists anyway.
+		return
+	}
+	d.applyBudgetResolution(syncsPeers, d.handle != nil && d.handle.CrossReplicaSyncer() != nil)
+}
+
+// applyBudgetResolution settles the peer-load scope, and whether the mode is
+// safe, from the in-flight producer's cross-replica behaviour and whether a
+// syncer is configured.
+func (d *detector) applyBudgetResolution(syncsPeers, haveSyncer bool) {
+	logger := d.logger
+	if !syncsPeers {
+		logger.V(logutil.DEFAULT).Info("Flow-control budget divides the full limit: the in-flight load excludes peers",
+			"inFlightLoadProducer", d.inFlightProducerName, "dynamicBudget", d.config.budgetMode)
+		d.budget.setPeerLoadScope(peerLoadLocal)
+		return
+	}
+	if d.config.budgetMode != budgetAlways {
+		d.budget.setPeerLoadScope(peerLoadSynced)
+		return
+	}
+	if !haveSyncer {
+		// No syncer: the producer's synced load has no peers to add, so it is
+		// local and the limit can be divided.
+		d.budget.setPeerLoadScope(peerLoadLocal)
+		return
+	}
+	logger.Error(nil, "dynamicBudget \"always\" is invalid with a cross-replica syncer and an in-flight producer that syncs "+
+		"cross-replica state: the synced load already covers the whole deployment, so dividing the limit would halve capacity. "+
+		"Falling back to the full limit; use dynamicBudget \"onPeerLoss\" instead.",
+		"inFlightLoadProducer", d.inFlightProducerName)
+	d.budget.fallBackToFullLimit()
+}
+
+// inFlightLoadSyncsPeers reports whether the in-flight producer this detector
+// reads publishes its load to the cross-replica syncer. known is false when the
+// producer is not on the handle.
+func (d *detector) inFlightLoadSyncsPeers() (syncsPeers, known bool) {
+	if d.handle == nil {
+		return false, false
+	}
+	plugin := d.handle.Plugin(d.inFlightProducerName)
+	if plugin == nil {
+		return false, false
+	}
+	contributor, ok := plugin.(datalayer.CrossReplicaContributor)
+	if !ok {
+		// A producer that does not contribute to cross-replica state keeps its
+		// load local.
+		return false, true
+	}
+	return !contributor.CrossReplicaState().SyncDisabled, true
 }
 
 // TypedName returns the type and name tuple of this plugin instance.
@@ -188,6 +324,7 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 		return 1.0
 	}
 
+	maxRequests, maxTokens := d.limits()
 	var reqInflight, reqCapacity, tokInflight, tokCapacity int64
 	var endpointCount int
 	var hybridSatSum float64
@@ -197,8 +334,8 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 		}
 
 		endpointCount++
-		reqCapacity += d.config.maxConcurrency
-		tokCapacity += d.config.maxTokenConcurrency
+		reqCapacity += maxRequests
+		tokCapacity += maxTokens
 
 		if e.GetMetadata() == nil {
 			continue
@@ -208,8 +345,8 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 		reqInflight += load.Requests
 		tokInflight += load.Tokens
 		hybridSatSum += max(
-			ratio(load.Requests, d.config.maxConcurrency),
-			ratio(load.Tokens, d.config.maxTokenConcurrency),
+			ratio(load.Requests, maxRequests),
+			ratio(load.Tokens, maxTokens),
 		)
 	}
 	pendingDispatches := d.pendingDispatches.Load()
@@ -254,8 +391,9 @@ func (d *detector) Filter(
 	// Pre-allocate assuming most endpoints will pass the filter to minimize allocations.
 	filtered := make([]fwksched.Endpoint, 0, len(endpoints))
 
-	reqLimit := int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
-	tokLimit := int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
+	reqMax, tokMax := d.limits()
+	reqLimit := int64(float64(reqMax) * (1.0 + d.config.headroom))
+	tokLimit := int64(float64(tokMax) * (1.0 + d.config.headroom))
 	countIncoming := d.config.mode == modeTokens || d.config.mode == modeHybrid
 
 	for _, e := range endpoints {

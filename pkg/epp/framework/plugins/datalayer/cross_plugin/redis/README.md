@@ -263,8 +263,34 @@ decisions before either observes the other's latest work.
 
 This synchronization does not implement an atomic cluster-wide admission
 quota. Flow control admission across replicas, including fixed per-replica
-shares, is described in
+shares and the `concurrency-detector` dynamic budget, is described in
 [Multiple active replicas](../../../../../flowcontrol/README.md#multiple-active-replicas).
+
+The syncer reports the replica set to `concurrency-detector` through two
+interfaces, so that budget is sized from the same heartbeat peers are judged by:
+
+- `ReplicaCounter.ActiveReplicas` counts the live replicas, this one included,
+  using the `refresh:<replica field>` liveness fields described in
+  [Peer liveness](#peer-liveness). A retained prefix window from a departed
+  replica is not counted, so a long `prefixStateTTL` never inflates the divisor.
+  A hash with no liveness field at all keeps the pre-liveness reading, in which
+  every replica it names is live.
+- `PeerLoadReporter.PeerLoadFresh` reports whether a hash read succeeded within
+  `inflightStateTTL`, the TTL that expires in-flight accounting. That is the
+  window in which a peer's published load still counts, so it is also the window
+  in which the synced load covers the whole deployment.
+
+Both values are cached. `ActiveReplicas` keeps its last observation across a
+failed publication, and `PeerLoadFresh` turns false once `inflightStateTTL`
+passes without one, so an unreachable Valkey leaves the budget divided at the
+last known count instead of widening to the full limit.
+
+`redis_syncer_active_peers` and the detector's own
+`llm_d_epp_flow_control_budget_replicas` measure different things and are
+expected to differ by one: `active_peers` excludes this replica and is labeled
+per state key, while `budget_replicas` includes it and is labeled per detector.
+A `budget_replicas` of N therefore corresponds to `active_peers` of N-1 for the
+state key the detector reads.
 
 `GetOrSet` coordinates one value for one request identifier. It does not reserve
 capacity across different requests.

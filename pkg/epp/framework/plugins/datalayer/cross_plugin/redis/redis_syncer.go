@@ -65,6 +65,7 @@ const (
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
 var _ fwkdl.CrossReplicaBatchSyncer = (*RedisSyncer)(nil)
+var _ fwkdl.ReplicaCounter = (*RedisSyncer)(nil)
 
 type redisConfig struct {
 	Address           string `json:"address"`
@@ -117,6 +118,9 @@ type RedisSyncer struct {
 	epochs        atomic.Uint64
 	publishBudget *byteBudget
 	readBudget    *byteBudget
+	// replicaCounts is the live replica count across the endpoint hashes this
+	// replica reads. See observeReplicas.
+	replicas replicaCounts
 }
 
 // inflightTTL is the TTL for whole values such as in-flight load and budget
@@ -422,6 +426,7 @@ func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, key fwkdl.StateKey
 	}
 	s.storeAggregate(key, hashKey, entry)
 
+	s.observeReplicas(hashKey, raw)
 	return len(remoteValues)
 }
 

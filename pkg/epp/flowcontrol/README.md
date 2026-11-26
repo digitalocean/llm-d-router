@@ -173,6 +173,34 @@ Fixed shares have these costs:
   positive integer, so the remainder of a limit that the replica count does not divide goes unused,
   and a limit lower than the replica count cannot be enforced.
 
+#### Dynamic budget
+
+Instead of dividing the limit by hand, set `dynamicBudget: onPeerLoss` on `concurrency-detector`. It
+keeps the deployment-wide `maxConcurrency` and `maxTokenConcurrency` in configuration and divides
+them at runtime by the replica count reported by the `CrossReplicaSyncer`, but **only while peer
+in-flight load is missing or stale**. While peer load is fresh it enforces the full limit, because
+the synced load already covers the deployment.
+
+```
+effective = ceil(global_limit / active_replicas * budgetOversubscription)   # only on peer loss
+```
+
+`redis-syncer` reports both the replica count and peer freshness from the same per-replica state it
+already uses to share endpoint data. The count follows the `refresh:<replica field>` liveness field,
+which expires on `inflightStateTTL`, so a peer leaves the count when its heartbeat expires and joins
+it when it first publishes — a prefix window retained on the longer `prefixStateTTL` does not keep a
+departed replica in the divisor. Peer freshness uses the same in-flight TTL.
+`expectedReplicas` divides the limit before the first count is known, and an unreachable store keeps
+the last computed share. See the
+[concurrency detector](../framework/plugins/flowcontrol/saturationdetector/concurrency/README.md#dynamic-budget)
+for the mode table, the details and the budget metrics.
+
+**This is the recommended configuration for production HA**, because it is correct with the default
+`inflight-load-producer` settings. Leave `syncCrossReplicaState` at its default (`true`): with fresh
+peer values the full limit is right, and when sync lapses the share takes over. `dynamicBudget:
+always` is only for a producer with `syncCrossReplicaState: false`, and is rejected at startup when
+both sync and a syncer are configured.
+
 ### High Level Architecture
 
 The following diagram illustrates the high-level dependency model and request flow for the system. It shows how

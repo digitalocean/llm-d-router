@@ -987,6 +987,10 @@ These metrics are owned by the EPP Flow Control layer.
 | `llm_d_epp_flow_control_queue_bytes` | Gauge | `fairness_id`, `priority`, `inference_pool`, `model_name`, `target_model_name` | Bytes currently held in the queue. |
 | `llm_d_epp_flow_control_pool_saturation` | Gauge | `inference_pool`, `stage` | Saturation signal used to gate dispatch. |
 | `llm_d_epp_flow_control_stale_endpoints` | Gauge | `detector`, `stage` | Candidate endpoints with missing or stale metrics. |
+| `llm_d_epp_flow_control_effective_request_budget` | Gauge | `detector` | Request limit `concurrency-detector` enforces on this replica. |
+| `llm_d_epp_flow_control_effective_token_budget` | Gauge | `detector` | Token limit `concurrency-detector` enforces on this replica. |
+| `llm_d_epp_flow_control_budget_replicas` | Gauge | `detector` | EPP replicas the divided flow-control budget uses; `1` when the full limit is in force. |
+| `llm_d_epp_flow_control_budget_divided` | Gauge | `detector` | `1` when the divided share is enforced, `0` when the full limit is used. |
 | `llm_d_epp_flow_control_detector_saturation` | Gauge | `detector`, `stage` | Saturation reported by each child of a `max-saturation-detector`, from its most recent evaluation. `stage` is `prefill`, `decode`, or empty when the pool has no endpoints. |
 | `llm_d_epp_flow_control_capacity_utilization_requests` | Gauge | `priority`, `inference_pool` | Per-priority-band request capacity use. |
 | `llm_d_epp_flow_control_capacity_utilization_bytes` | Gauge | `priority`, `inference_pool` | Per-priority-band byte capacity use. |
@@ -1068,6 +1072,50 @@ These metrics are owned by the EPP Flow Control layer.
 *   **Usage:** A nonzero value during a dispatch stall indicates a model server metrics collection
     problem (endpoint path, port, TLS, or authentication) rather than genuine overload. Check the
     `stage` label to localize the collection problem to one pipeline stage.
+
+#### `llm_d_epp_flow_control_effective_request_budget`
+
+*   **Type:** Gauge
+*   **Labels:** `detector`
+*   **Description:** Request limit the `concurrency-detector` enforces on this replica. Equals
+    `maxConcurrency` when `dynamicBudget` is `off`, or when it is `onPeerLoss` and peer in-flight load
+    is fresh; otherwise it is `ceil(maxConcurrency / active_replicas * budgetOversubscription)`, where
+    `active_replicas` counts this replica and the peers its cross-replica syncer still holds a
+    heartbeat for.
+*   **Usage:** Compare against the sum across replicas to verify the deployment-wide budget is not
+    over- or under-admitted. Pair with `llm_d_epp_flow_control_budget_divided` to tell the full limit
+    from a share that happens to equal it.
+
+#### `llm_d_epp_flow_control_effective_token_budget`
+
+*   **Type:** Gauge
+*   **Labels:** `detector`
+*   **Description:** Token limit the `concurrency-detector` enforces on this replica, the
+    `maxTokenConcurrency` counterpart of `llm_d_epp_flow_control_effective_request_budget`.
+*   **Usage:** Same as `llm_d_epp_flow_control_effective_request_budget`, for token accounting.
+
+#### `llm_d_epp_flow_control_budget_replicas`
+
+*   **Type:** Gauge
+*   **Labels:** `detector`
+*   **Description:** Number of active EPP replicas the flow-control budget was divided by, as counted
+    from cross-replica heartbeats. Reports `1` when the full deployment-wide limit is in force, which
+    includes `dynamicBudget: off`, a single replica, and `onPeerLoss` with fresh peer load.
+*   **Usage:** An unchanged value while replicas are added or removed indicates the cross-replica
+    syncer is not reporting a count, and every replica is still admitting its last share.
+
+#### `llm_d_epp_flow_control_budget_divided`
+
+*   **Type:** Gauge
+*   **Labels:** `detector`
+*   **Description:** Whether the flow-control limit is currently divided across replicas: `1` when the
+    per-replica share is enforced, `0` when the full deployment-wide limit is in use. With
+    `dynamicBudget: onPeerLoss`, `1` means peer in-flight load is missing or stale and this replica is
+    covering the deployment-wide limit alone.
+*   **Usage:** The primary signal for `onPeerLoss`. A sustained `1` means the cross-replica syncer has
+    not completed a read within `inflightStateTTL`: Valkey is unreachable, its credentials or address
+    are wrong, or publication is failing. Alerts fired on a short-lived `1` during a burst double count
+    the brief sync lag; use a duration long enough to exclude a few publication cycles.
 
 #### `llm_d_epp_flow_control_capacity_utilization_requests`
 
