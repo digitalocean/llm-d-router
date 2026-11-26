@@ -60,13 +60,14 @@ const (
 var minBlockSizeTokens = 64
 
 var (
-	_ fwkrh.DataProducer                = &dataProducer{}
-	_ fwkrh.PreRequest                  = &dataProducer{}
-	_ fwkrh.ResponseBodyProcessor       = &dataProducer{}
-	_ plugin.StateDumper                = &dataProducer{}
-	_ datalayer.EndpointExtractor       = (*dataProducer)(nil)
-	_ datalayer.Registrant              = &dataProducer{}
-	_ datalayer.CrossReplicaContributor = (*dataProducer)(nil)
+	_ fwkrh.DataProducer                    = &dataProducer{}
+	_ fwkrh.PreRequest                      = &dataProducer{}
+	_ fwkrh.ResponseBodyProcessor           = &dataProducer{}
+	_ plugin.StateDumper                    = &dataProducer{}
+	_ datalayer.EndpointExtractor           = (*dataProducer)(nil)
+	_ datalayer.Registrant                  = &dataProducer{}
+	_ datalayer.CrossReplicaContributor     = (*dataProducer)(nil)
+	_ datalayer.CrossReplicaWarmStartMerger = (*dataProducer)(nil)
 )
 
 // indexUpdateStateKey identifies the per-request record of indexer entries
@@ -771,6 +772,32 @@ func (p *dataProducer) Extract(ctx context.Context, event datalayer.EndpointEven
 		})
 	}
 	return nil
+}
+
+// MergeWarmStart folds peer windows the syncer read at startup into the local
+// index, so the index holds peer prefix state before the replica reports ready
+// instead of on the first request. The syncer has already cached the peer
+// aggregates, so this is the same merge Produce performs, run once over the
+// endpoints registered so far.
+func (p *dataProducer) MergeWarmStart(ctx context.Context) {
+	if !p.syncerActive() || p.indexerInst == nil {
+		return
+	}
+	var pods []fwksched.Endpoint
+	p.registeredEndpoints.Range(func(_, value any) bool {
+		ep, ok := value.(datalayer.Endpoint)
+		if !ok {
+			return true
+		}
+		pods = append(pods, fwksched.NewEndpoint(ep.GetMetadata(), ep.GetMetrics(), ep.GetAttributes()))
+		return true
+	})
+	if len(pods) == 0 {
+		return
+	}
+	p.mergeRemoteHashes(pods)
+	log.FromContext(ctx).V(logutil.DEFAULT).Info("Merged warm-started peer prefix window into the index",
+		"endpoints", len(pods))
 }
 
 func (p *dataProducer) makeserver(targetEndpoint fwksched.Endpoint) server {

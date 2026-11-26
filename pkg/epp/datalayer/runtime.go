@@ -65,6 +65,16 @@ type Runtime struct {
 	// notificationSyncs remains nil until Start has registered every source.
 	notificationSyncs []*notificationInitialSync
 
+	// warmStart tracks the one-shot peer-state read a starting replica performs
+	// before it reports ready. It starts once the notification sources have
+	// delivered their initial endpoint sets, because those endpoints are what
+	// the syncer reads peer state for.
+	warmStartMu      sync.Mutex
+	warmStartStarted bool
+	warmStartDone    bool
+	// warmStartCtx is the serving context Start received, used by the warm start.
+	warmStartCtx context.Context
+
 	pendingMu            sync.Mutex
 	pendingRegistrations []fwkdl.PendingRegistration // code-registered (source-type, extractor) pairs, resolved by Configure()
 
@@ -399,6 +409,7 @@ func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
 	r.notificationSyncMu.Lock()
 	r.notificationSyncs = nil
 	r.notificationSyncMu.Unlock()
+	r.warmStartCtx = ctx
 
 	r.StartCrossReplicaSync(ctx)
 
@@ -429,7 +440,8 @@ func (r *Runtime) Start(ctx context.Context, mgr ctrl.Manager) error {
 }
 
 // CheckReady reports readiness after Start has registered every notification
-// source and each source has processed its initial Kubernetes events.
+// source and each source has processed its initial Kubernetes events, and after
+// the one-shot warm start that primes peer state has finished.
 func (r *Runtime) CheckReady() error {
 	r.notificationSyncMu.RLock()
 	defer r.notificationSyncMu.RUnlock()
@@ -442,7 +454,75 @@ func (r *Runtime) CheckReady() error {
 			return fmt.Errorf("notification source %s has not processed its initial events", initialSync.tracker.Name())
 		}
 	}
+	// Endpoints only exist once the initial event sets have been dispatched, so
+	// the warm start begins here rather than in Start.
+	r.startWarmStart()
+	return r.checkWarmStart()
+}
+
+// checkWarmStart reports readiness of the peer-state warm start. It is not
+// ready until the warm start has run and completed, however it completed: a
+// failed or timed-out warm start reports ready, because peer state is an
+// optimization and must not keep the replica out of rotation.
+func (r *Runtime) checkWarmStart() error {
+	r.warmStartMu.Lock()
+	defer r.warmStartMu.Unlock()
+	if r.crossReplicaPub == nil || !r.crossReplicaPub.warmsUp() {
+		return nil
+	}
+	if !r.warmStartStarted {
+		return errors.New("cross-replica warm start has not started")
+	}
+	if !r.warmStartDone {
+		return errors.New("cross-replica warm start is in progress")
+	}
 	return nil
+}
+
+// startWarmStart launches the peer-state warm start once, after the notification
+// sources have delivered their initial endpoint sets. It never blocks readiness
+// beyond the syncer's own warmStartTimeout.
+func (r *Runtime) startWarmStart() {
+	if !r.crossReplicaPub.warmsUp() {
+		return
+	}
+	warmStarter, ok := r.crossReplicaPub.warmStarter()
+	if !ok {
+		return
+	}
+	r.warmStartMu.Lock()
+	if r.warmStartStarted {
+		r.warmStartMu.Unlock()
+		return
+	}
+	r.warmStartStarted = true
+	ctx := r.warmStartCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.warmStartMu.Unlock()
+
+	specs := r.crossReplicaPub.specs()
+	logger := r.logger.WithValues("warmStart", true)
+	go func() {
+		// The endpoints are read here, not before the goroutine starts, so the
+		// first batch includes every endpoint the initial event sets produced.
+		endpointIDs := r.crossReplicaPub.endpointIDs()
+		result := warmStarter.WarmStart(ctx, specs, endpointIDs)
+		if result.Err != nil {
+			logger.Info("Cross-replica warm start finished without all peer state",
+				"endpoints", result.Endpoints, "peers", result.Peers, "error", result.Err.Error())
+		} else {
+			logger.V(logging.DEFAULT).Info("Cross-replica warm start finished",
+				"endpoints", result.Endpoints, "peers", result.Peers)
+		}
+		// Contributors fold the peer state the syncer cached into their own
+		// index, before readiness reports the replica as available.
+		r.crossReplicaPub.mergeWarmStart(ctx)
+		r.warmStartMu.Lock()
+		r.warmStartDone = true
+		r.warmStartMu.Unlock()
+	}()
 }
 
 func (*Runtime) TypedName() fwkplugin.TypedName {

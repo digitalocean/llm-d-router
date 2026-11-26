@@ -54,8 +54,13 @@ const (
 	// configured either. Prefix windows are expensive to rebuild from traffic and
 	// cheap to keep, so they outlive the per-replica accounting values.
 	defaultPrefixStateTTL = 10 * time.Minute
-	batchSize             = 100
-	batchConcurrency      = 8
+	// defaultWarmStartTimeout bounds the peer-state read a starting replica does
+	// before it reports ready. It is generous enough for a cold peer aggregate
+	// over a slow link and short enough that an unreachable Valkey delays
+	// readiness by half a minute, not forever.
+	defaultWarmStartTimeout = 30 * time.Second
+	batchSize               = 100
+	batchConcurrency        = 8
 )
 
 var _ fwkdl.CrossReplicaSyncer = (*RedisSyncer)(nil)
@@ -71,6 +76,7 @@ type redisConfig struct {
 	InflightStateTTL  string `json:"inflightStateTTL"`
 	PrefixStateTTL    string `json:"prefixStateTTL"`
 	CoordinationTTL   string `json:"coordinationTTL"`
+	WarmStartTimeout  string `json:"warmStartTimeout"`
 	WindowReplication string `json:"windowReplication"`
 	MaxBytesPerSecond int64  `json:"maxBytesPerSecond"`
 }
@@ -94,13 +100,20 @@ type RedisSyncer struct {
 	// traffic, so they outlive the accounting values by design.
 	prefixStateTTL  time.Duration
 	coordinationTTL time.Duration
-	cache           sync.Map
+	// warmStartTimeout bounds WarmStart.
+	warmStartTimeout time.Duration
+	cache            sync.Map
 	// peerGauges keeps activePeers and peerIndexEntries in step with cache.
 	peerGauges *peerGauges
 	// incremental publishes SequencedValues as streams instead of whole values.
 	incremental bool
 	// cursors maps a hash key to the streamCursor of this replica's stream.
-	cursors       sync.Map
+	cursors sync.Map
+	// prefixKeys records the state keys this replica published prefix windows
+	// under, so Delete retains their Redis state on the prefix TTL instead of
+	// removing it. Values are struct{}.
+	prefixKeys sync.Map
+	// epochs numbers the stream epochs this replica starts.
 	epochs        atomic.Uint64
 	publishBudget *byteBudget
 	readBudget    *byteBudget
@@ -124,14 +137,34 @@ func (s *RedisSyncer) prefixTTL() time.Duration {
 	return s.stateTTL
 }
 
+// heartbeatInterval is how often a stream publisher rewrites its marker even
+// when the window has not changed. The marker's timestamp is what tells peers
+// the replica is still live while its window is retained past the in-flight TTL,
+// so the interval is a fraction of that TTL: a peer must not look dead between
+// two heartbeats.
+func (s *RedisSyncer) heartbeatInterval() time.Duration {
+	heartbeat := s.inflightTTL() / 3
+	if heartbeat < crossreplica.MinimumDuration {
+		return crossreplica.MinimumDuration
+	}
+	return heartbeat
+}
+
 // valueTTL is the TTL for a published value: prefix windows outlive accounting
 // values. Sequenced values are the prefix windows; every other synced value is
 // per-replica accounting.
 func (s *RedisSyncer) valueTTL(value any) time.Duration {
-	if _, ok := value.(fwkdl.SequencedValue); ok {
+	if s.retainsPrefix(value) {
 		return s.prefixTTL()
 	}
 	return s.inflightTTL()
+}
+
+// retainsPrefix reports whether value is prefix-window state, which is kept on
+// the prefix TTL and outlives the replica that published it.
+func (s *RedisSyncer) retainsPrefix(value any) bool {
+	_, ok := value.(fwkdl.SequencedValue)
+	return ok
 }
 
 type aggregateCacheEntry struct {
@@ -140,8 +173,12 @@ type aggregateCacheEntry struct {
 	streams map[string]*streamPeer
 	// legacyPeers is how many whole-value peers the cached aggregate includes.
 	legacyPeers int
-	// peerIDs names the peers the cached aggregate includes, for activePeers.
+	// peerIDs names every peer the cached aggregate includes, for
+	// peerIndexEntries and the retained-window bookkeeping.
 	peerIDs []string
+	// activePeerIDs names the peers that refreshed within the in-flight TTL, for
+	// activePeers. A retained window from a departed replica stays in peerIDs.
+	activePeerIDs []string
 	// peerEntries counts the sequenced elements merged from peers, for
 	// peerIndexEntries. A whole-value peer counts as one.
 	peerEntries int
@@ -225,6 +262,10 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 	if err != nil {
 		return nil, err
 	}
+	warmStartTimeout, err := parseTTL("warmStartTimeout", cfg.WarmStartTimeout, defaultWarmStartTimeout)
+	if err != nil {
+		return nil, err
+	}
 	password, err := resolvePassword(cfg)
 	if err != nil {
 		return nil, err
@@ -277,6 +318,7 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 		inflightStateTTL: inflightStateTTL,
 		prefixStateTTL:   prefixStateTTL,
 		coordinationTTL:  coordinationTTL,
+		warmStartTimeout: warmStartTimeout,
 		peerGauges:       newPeerGauges(),
 		incremental:      incremental,
 		publishBudget:    newByteBudget(cfg.MaxBytesPerSecond),
@@ -313,6 +355,12 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 	pipe.HSet(ctx, hashKey, s.replicaID, data)
 	pipe.HPExpire(ctx, hashKey, ttl, s.replicaID)
 	pipe.PExpire(ctx, hashKey, ttl)
+	if s.retainsPrefix(value) {
+		s.prefixKeys.Store(key, struct{}{})
+		// The liveness field outlives neither stateTTL nor inflightStateTTL; in
+		// this path it only has to survive until the next tick rewrites it.
+		refreshCommands(ctx, pipe, hashKey, s.replicaID, s.inflightTTL())
+	}
 	result := pipe.HGetAll(ctx, hashKey)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("redis-syncer: set and get aggregate; Redis 7.4 or newer with HPEXPIRE is required: %w", err)
@@ -333,12 +381,19 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 
 // cachePeerAggregate replaces the cached peer aggregate for hashKey and returns
 // how many peers it holds. A hash with no peer value drops the cache entry.
+//
+// A whole-value peer cannot report its liveness inside its value, so the hash
+// carries a liveness field per replica for this path. A peer whose field has
+// expired keeps its value in the aggregate only while the value's own TTL keeps
+// it readable, and it does not count as an active peer.
 func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, key fwkdl.StateKey, hashKey string, value any, raw map[string]string, aggregate func([]any) any) int {
 	logger := ctrl.LoggerFrom(ctx)
+	live := newLiveSet(raw)
 	remoteValues := make([]any, 0, len(raw))
 	peerIDs := make([]string, 0, len(raw))
+	activePeerIDs := make([]string, 0, len(raw))
 	for _, field := range slices.Sorted(maps.Keys(raw)) {
-		if field == s.replicaID {
+		if field == s.replicaID || strings.HasPrefix(field, refreshPrefix) || strings.HasPrefix(field, markerPrefix) {
 			continue
 		}
 		encoded := raw[field]
@@ -351,14 +406,18 @@ func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, key fwkdl.StateKey
 		}
 		remoteValues = append(remoteValues, remoteValue)
 		peerIDs = append(peerIDs, field)
+		if live.isLive(field) {
+			activePeerIDs = append(activePeerIDs, field)
+		}
 	}
 
 	var entry *aggregateCacheEntry
 	if len(remoteValues) > 0 {
 		entry = &aggregateCacheEntry{
-			value:       aggregate(remoteValues),
-			peerIDs:     peerIDs,
-			peerEntries: len(remoteValues),
+			value:         aggregate(remoteValues),
+			peerIDs:       peerIDs,
+			activePeerIDs: activePeerIDs,
+			peerEntries:   len(remoteValues),
 		}
 	}
 	s.storeAggregate(key, hashKey, entry)
@@ -462,6 +521,7 @@ func (s *RedisSyncer) publishChunk(ctx context.Context, key fwkdl.StateKey, aggr
 		value := read(endpointID)
 		pub := &publication{endpointID: endpointID, hashKey: s.hashKey(key, endpointID), value: value}
 		if sequenced, ok := value.(fwkdl.SequencedValue); ok && s.incremental {
+			s.prefixKeys.Store(key, struct{}{})
 			pub.stream, pub.commands = s.queueStream(ctx, pipe, key, pub.hashKey, sequenced)
 		} else {
 			data, err := crossreplica.EncodeValue(value)
@@ -474,6 +534,10 @@ func (s *RedisSyncer) publishChunk(ctx context.Context, key fwkdl.StateKey, aggr
 				pipe.HSet(ctx, pub.hashKey, s.replicaID, data),
 				pipe.HPExpire(ctx, pub.hashKey, ttl, s.replicaID),
 				pipe.PExpire(ctx, pub.hashKey, ttl),
+			}
+			if s.retainsPrefix(value) {
+				s.prefixKeys.Store(key, struct{}{})
+				pub.commands = append(pub.commands, refreshCommands(ctx, pipe, pub.hashKey, s.replicaID, s.inflightTTL())...)
 			}
 		}
 		pub.result = pipe.HGetAll(ctx, pub.hashKey)
@@ -567,17 +631,22 @@ func (s *RedisSyncer) Get(ctx context.Context, spec fwkdl.CrossReplicaSpec, endp
 func (s *RedisSyncer) delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
 	hashKey := s.hashKey(key, endpointID)
 	s.storeAggregate(key, hashKey, nil)
-	if !s.incremental {
+	if !s.retainsKeyPrefix(key) {
 		return s.client.HDel(ctx, hashKey, s.replicaID).Err()
 	}
+	// A prefix window is retained on its TTL so a restarted replica, or every
+	// replica after a correlated crash, can rebuild it from Valkey. The value or
+	// marker and the stream stay; only this replica's liveness goes, so the
+	// window stops counting as an active peer while it stays readable.
 	s.cursors.Delete(hashKey)
-	pipe := s.client.Pipeline()
-	hdel := pipe.HDel(ctx, hashKey, s.replicaID, markerField(s.replicaID))
-	pipe.Del(ctx, s.streamKey(hashKey, s.replicaID))
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
-	return hdel.Err()
+	return s.client.HDel(ctx, hashKey, refreshField(s.replicaID)).Err()
+}
+
+// retainsKeyPrefix reports whether this replica published prefix windows under
+// key, which is what makes its Redis state worth retaining on Delete.
+func (s *RedisSyncer) retainsKeyPrefix(key fwkdl.StateKey) bool {
+	_, ok := s.prefixKeys.Load(key)
+	return ok
 }
 
 func (s *RedisSyncer) Delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {

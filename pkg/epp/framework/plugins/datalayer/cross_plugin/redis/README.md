@@ -51,6 +51,11 @@ Parameters:
   `1ms`.
 - `coordinationTTL`: Expiration for request-level coordination values. Defaults
   to `180s` and must be at least `1ms`.
+- `warmStartTimeout`: How long a starting replica reads peer state before it
+  reports ready. Defaults to `30s` and must be at least `1ms`. The timeout never
+  blocks readiness indefinitely: a slow or unreachable Valkey costs at most this
+  long at startup, and the replica becomes ready with whatever peer state it
+  read. See [Warm start](#warm-start).
 - `windowReplication`: How sequenced values such as approximate-prefix windows
   are published. `full` (default) writes the whole value every tick.
   `incremental` appends only new generations to a per-replica Redis stream.
@@ -136,6 +141,71 @@ Both per-kind parameters fall back to `stateTTL` when it is set and they are
 not, so a configuration that sets `stateTTL` alone expires every kind of state
 on that TTL, exactly as before the split.
 
+### Peer liveness
+
+The prefix TTL keeps a window readable after the replica that wrote it is gone.
+That is the point of the long retention, but the window must not keep counting
+as a live peer. Each replica therefore writes a liveness field, `refresh:<replica
+field>`, next to its value on every publication tick, with `inflightStateTTL`.
+A peer counts as active while its liveness field is present; its retained
+window still contributes prefix prompts until the prefix TTL removes it.
+
+A replica that leaves the endpoint set has its own field removed, so its window
+stops counting immediately for the replica that deleted it. For every other
+replica the field expires `inflightStateTTL` after the last publication, which
+is the same bound a crashed replica had before.
+
+A hash written before the liveness field existed has none, and is read as it was
+before: every replica it names counts as active. A hash that mixes both forms is
+read per replica, so a replica running an older version while another writes the
+field reports as inactive; this affects only the `active_peers` gauge, since
+load and budget accounting are never retained. This lets a fleet roll through
+versions that write the field.
+
+### Retention
+
+Prefix state outlives the replica that published it, so a restarted replica, or
+every replica after a correlated crash, can rebuild from Valkey while Valkey
+itself is up. When an endpoint is deleted, the replica that deletes it removes
+only its liveness field. Its value or marker and its stream stay behind, and
+keep the field TTL `prefixStateTTL` set by their last publication. Removing an
+endpoint therefore does not discard the prefix window that other replicas or a
+replacement process may need.
+
+Retained state is garbage-collected by Valkey on that field TTL, counted from
+the last publication before the replica departed; nothing else has to run. The
+window is readable for the whole retention window, and `active_peers` drops the
+replica within `inflightStateTTL`.
+
+A retained window keeps contributing prefix prompts to peer aggregates. Those
+prompts were prefetched on the model servers, which are still running, so they
+remain useful for routing after the replica that recorded them is gone.
+
+### Warm start
+
+A starting replica reads peer state from Valkey before it reports ready.
+`WarmStart` runs once, after the notification sources deliver their initial
+endpoint sets and therefore after endpoints exist, and reads:
+
+- every endpoint's hash for each synced state key, then
+- the stream elements the peer markers name, so incremental windows are
+  restored as well as whole-value ones.
+
+Contributors that implement `CrossReplicaWarmStartMerger`, such as
+`approx-prefix-cache-producer`, fold that state into their own index before
+readiness flips. The effect is that the prefix index is populated before the
+first request rather than on it.
+
+The whole read is bounded by `warmStartTimeout`. If it expires, or Valkey is
+unreachable, the replica logs the shortfall, records
+`redis_syncer_warm_start_total{outcome="timeout"}` or `outcome="aborted"`, and
+becomes ready with the peer state it did read. Readiness is never blocked
+indefinitely, because peer state is an optimization: an EPP without it routes on
+local state exactly as it did before this feature.
+
+`redis_syncer_warm_start_total{outcome="completed"}` counts a warm start that
+read every endpoint, and `redis_syncer_warm_start_peers` reports what it merged.
+
 ### Incremental replication
 
 With `windowReplication: incremental`, a replica publishes a sequenced value
@@ -178,6 +248,9 @@ mode, then switch replicas to `incremental`.
 | `redis_syncer_peer_index_entries` | `state_key` | Sequenced elements merged from peer streams; a whole-value peer counts as one. |
 | `redis_syncer_last_successful_sync_timestamp_seconds` | `state_key` | Unix time of the last publication that failed for no endpoint. `time()` minus this is the sync lag. |
 | `redis_syncer_stream_budget_bytes_per_second` | `direction` | Effective per-replica `maxBytesPerSecond`; publish and read budgets are separate. |
+| `redis_syncer_warm_start_total` | `outcome` | Warm starts attempted: `completed`, `timeout`, or `aborted`. |
+| `redis_syncer_warm_start_duration_seconds` | `outcome` | Wall time of one warm start, which is readiness latency added at startup. |
+| `redis_syncer_warm_start_peers` | - | Peer values the last warm start merged. |
 
 Request-level coordination uses separate string keys and `SET NX GET` so the
 first value stored for a request is selected atomically across EPP replicas.
@@ -205,6 +278,10 @@ are logged at error level with rate limiting and leave the peer cache unchanged,
 so scheduling keeps counting the last known peer state until a publication
 succeeds. A peer that stops while Redis is unreachable keeps counting until
 then. Before its first successful publication an EPP uses local state only.
+
+Startup reads peer state once, bounded by `warmStartTimeout`, before readiness
+goes true. That read is the only point where an unreachable Valkey delays
+readiness; it never prevents it.
 
 `GetOrSet` does not use a local fallback. It returns Redis errors because its
 callers require cross-replica atomicity.

@@ -163,11 +163,39 @@ var (
 		[]string{"direction"},
 	)
 
+	warmStartTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_warm_start_total",
+			Help:      metricsutil.HelpMsgWithStability("Warm starts this replica attempted, by outcome. completed read every endpoint, timeout and aborted left part of the peer state unread.", compbasemetrics.ALPHA),
+		},
+		[]string{"outcome"},
+	)
+
+	warmStartDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_warm_start_duration_seconds",
+			Help:      metricsutil.HelpMsgWithStability("Time one warm start took. This is readiness latency added at startup when Valkey is slow or unreachable.", compbasemetrics.ALPHA),
+			Buckets:   metricsutil.GeneralLatencyBuckets,
+		},
+		[]string{"outcome"},
+	)
+
+	warmStartPeers = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_warm_start_peers",
+			Help:      metricsutil.HelpMsgWithStability("Peer values the last warm start merged. Zero after a failed warm start means this replica started with local state only.", compbasemetrics.ALPHA),
+		},
+	)
+
 	// registeredMetrics lists every collector this plugin registers.
 	registeredMetrics = []prometheus.Collector{
 		streamBytes, streamBudgetExhausted, streamResets, streamPeerLag, setBatchDuration,
 		valkeyCommands, valkeyCommandDuration, valkeyUp, activePeers, peerIndexEntries,
 		lastSuccessfulSync, streamBudgetBytesPerSecond,
+		warmStartTotal, warmStartDuration, warmStartPeers,
 	}
 )
 
@@ -201,21 +229,37 @@ func observeStreamBudget(bytesPerSecond int64) {
 	}
 }
 
+// warmStartOutcome values report how a warm start ended.
+const (
+	warmStartCompleted = "completed"
+	warmStartTimeout   = "timeout"
+	warmStartAborted   = "aborted"
+)
+
+// observeWarmStart records one warm start attempt.
+func observeWarmStart(outcome string, result fwkdl.WarmStartResult, elapsed time.Duration) {
+	warmStartTotal.WithLabelValues(outcome).Inc()
+	warmStartDuration.WithLabelValues(outcome).Observe(elapsed.Seconds())
+	warmStartPeers.Set(float64(result.Peers))
+}
+
 // peerGauges maintains activePeers and peerIndexEntries from cache writes
 // instead of by scanning the cache at scrape time. A peer counts once per state
 // key however many endpoints it appears under, so activePeers is the size of
-// the peer set this replica sees.
+// the live peer set this replica sees. A window retained from a departed
+// replica keeps contributing peerIndexEntries, because its prompts are still
+// merged, but it is not an active peer.
 type peerGauges struct {
 	mu sync.Mutex
-	// peers maps a state key to the replica IDs its cached aggregates hold and
-	// the number of cached endpoints holding each.
-	peers map[string]map[string]int
+	// active maps a state key to the live peer replica IDs its cached
+	// aggregates hold, and how many cached endpoints hold each.
+	active map[string]map[string]int
 	// entries is how many peer elements the state key's cached aggregates hold.
 	entries map[string]int
 }
 
 func newPeerGauges() *peerGauges {
-	return &peerGauges{peers: map[string]map[string]int{}, entries: map[string]int{}}
+	return &peerGauges{active: map[string]map[string]int{}, entries: map[string]int{}}
 }
 
 // replace moves the bookkeeping of one cached hash key from prev to next. A nil
@@ -224,13 +268,13 @@ func (g *peerGauges) replace(key fwkdl.StateKey, prev, next *aggregateCacheEntry
 	label := string(key)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	counted := g.peers[label]
+	counted := g.active[label]
 	if counted == nil {
 		counted = map[string]int{}
-		g.peers[label] = counted
+		g.active[label] = counted
 	}
 	if prev != nil {
-		for _, id := range prev.peerIDs {
+		for _, id := range prev.activePeerIDs {
 			if counted[id]--; counted[id] <= 0 {
 				delete(counted, id)
 			}
@@ -238,7 +282,7 @@ func (g *peerGauges) replace(key fwkdl.StateKey, prev, next *aggregateCacheEntry
 		g.entries[label] -= prev.peerEntries
 	}
 	if next != nil {
-		for _, id := range next.peerIDs {
+		for _, id := range next.activePeerIDs {
 			counted[id]++
 		}
 		g.entries[label] += next.peerEntries

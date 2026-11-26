@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -230,6 +231,55 @@ func (p *crossReplicaPublisher) endpointSnapshot() []types.NamespacedName {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.endpoints.UnsortedList()
+}
+
+// specs returns the cross-replica state declarations of the contributors.
+func (p *crossReplicaPublisher) specs() []fwkdl.CrossReplicaSpec {
+	specs := make([]fwkdl.CrossReplicaSpec, 0, len(p.contributors))
+	for _, c := range p.contributors {
+		specs = append(specs, c.CrossReplicaState())
+	}
+	return specs
+}
+
+// endpointIDs returns the registered endpoint IDs, sorted for a deterministic
+// warm-start order.
+func (p *crossReplicaPublisher) endpointIDs() []string {
+	snapshot := p.endpointSnapshot()
+	ids := make([]string, 0, len(snapshot))
+	for _, key := range snapshot {
+		ids = append(ids, key.String())
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// warmStarter returns the syncer as a CrossReplicaWarmStarter when it supports
+// warm starts.
+func (p *crossReplicaPublisher) warmStarter() (fwkdl.CrossReplicaWarmStarter, bool) {
+	starter, ok := p.syncer.(fwkdl.CrossReplicaWarmStarter)
+	return starter, ok
+}
+
+// warmsUp reports whether this syncer performs a warm start that readiness
+// must wait for.
+func (p *crossReplicaPublisher) warmsUp() bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.syncer.(fwkdl.CrossReplicaWarmStarter)
+	return ok
+}
+
+// mergeWarmStart lets contributors fold warm-started peer state into their own
+// views. It runs on the warm-start goroutine, before readiness reports the
+// replica as available, so no request can observe a half-restored index.
+func (p *crossReplicaPublisher) mergeWarmStart(ctx context.Context) {
+	for _, c := range p.contributors {
+		if merger, ok := c.(fwkdl.CrossReplicaWarmStartMerger); ok {
+			merger.MergeWarmStart(ctx)
+		}
+	}
 }
 
 func (p *crossReplicaPublisher) handleEndpointEvent(ctx context.Context, event fwkdl.EndpointEvent, plugin fwkplugin.Plugin) {
