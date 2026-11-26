@@ -494,6 +494,33 @@ All three `outcome` series and the duration histogram are created at zero when a
 starts for a source type, so a first `error` or `timeout` after a healthy run is a 0 to 1
 increment that `rate()` and `increase()` can see, not a series that first appears at `1`.
 
+### Cross-replica state (Redis syncer)
+
+These metrics belong to the `redis-syncer` plugin. They are registered when the plugin is
+configured and cover both the Valkey client and the peer state this replica holds. `state_key` is
+the contributor's state key, such as `approx-prefix:<name>`, so one deployment with several synced
+contributors emits one series set per key.
+
+| Full metric name | Type | Labels | Notes |
+|---|---|---|---|
+| `llm_d_epp_redis_syncer_valkey_commands_total` | Counter | `op`, `result` | Commands sent to Valkey, by command name and outcome (`success` or `error`). Every command in a pipeline is counted once. |
+| `llm_d_epp_redis_syncer_valkey_command_duration_seconds` | Histogram | `op` | Command wall time, from 50 µs to 2 s. Commands sent in one pipeline share the pipeline's duration. |
+| `llm_d_epp_redis_syncer_valkey_up` | Gauge | - | `1` when the last command reached Valkey, `0` when it did not. It stays `0` until the first command succeeds. |
+| `llm_d_epp_redis_syncer_active_peers` | Gauge | `state_key` | Distinct peer replicas whose values this replica holds in a cached peer aggregate. |
+| `llm_d_epp_redis_syncer_peer_index_entries` | Gauge | `state_key` | Sequenced elements merged from peer streams. A whole-value peer counts as one entry. |
+| `llm_d_epp_redis_syncer_last_successful_sync_timestamp_seconds` | Gauge | `state_key` | Unix time of the last publication that failed for no endpoint. `time()` minus this value is the sync lag. |
+| `llm_d_epp_redis_syncer_stream_bytes_total` | Counter | `state_key`, `direction` | Stream payload bytes written (`publish`) or read (`read`). |
+| `llm_d_epp_redis_syncer_stream_budget_exhausted_total` | Counter | `state_key`, `direction` | Ticks that deferred stream work because `maxBytesPerSecond` was spent. |
+| `llm_d_epp_redis_syncer_stream_budget_bytes_per_second` | Gauge | `direction` | Effective per-replica stream budget. Publish and read budgets are separate. |
+| `llm_d_epp_redis_syncer_stream_resets_total` | Counter | `state_key` | Streams the writer restarted under a new epoch. |
+| `llm_d_epp_redis_syncer_stream_peer_lag_generations` | Histogram | `state_key` | Generations a peer read was behind the peer's tip. |
+
+`valkey_up` reports reachability from the syncer's own traffic: a command that fails with a
+transport error sets it to `0`, and any command that reaches the server, including one the server
+rejects, sets it to `1`. A command the caller cancelled leaves it unchanged. `active_peers` counts
+peers from this replica's cache, so a peer stops counting for a state key when its values expire
+from Valkey and the next publication rebuilds the aggregate without them.
+
 ### Endpoint health
 
 These metrics belong to `endpoint-health-filter`. They are registered when the filter is configured

@@ -17,11 +17,16 @@ limitations under the License.
 package redis
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	goredis "github.com/redis/go-redis/v9"
 	compbasemetrics "k8s.io/component-base/metrics"
 
 	metricsutil "github.com/llm-d/llm-d-router/pkg/common/observability/metrics"
@@ -32,7 +37,20 @@ import (
 const (
 	directionPublish = "publish"
 	directionRead    = "read"
+
+	// resultSuccess and resultError are the values of the result label on
+	// valkeyCommands: whether the command completed, with an error the server
+	// returned or not.
+	resultSuccess = "success"
+	resultError   = "error"
 )
+
+// valkeyLatencyBuckets is a sub-millisecond-first ladder for Redis round trips.
+// GeneralLatencyBuckets starts at 5ms, which hides the range that separates a
+// healthy Valkey from a slow one.
+var valkeyLatencyBuckets = []float64{
+	0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2,
+}
 
 var (
 	streamBytes = prometheus.NewCounterVec(
@@ -81,12 +99,82 @@ var (
 		},
 		[]string{"state_key"},
 	)
+
+	valkeyCommands = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_valkey_commands_total",
+			Help:      metricsutil.HelpMsgWithStability("Valkey commands this replica sent, by command and outcome. Each command in a pipeline is counted once.", compbasemetrics.ALPHA),
+		},
+		[]string{"op", "result"},
+	)
+
+	valkeyCommandDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_valkey_command_duration_seconds",
+			Help:      metricsutil.HelpMsgWithStability("Wall time of Valkey commands this replica sent. Commands sent in one pipeline share the pipeline's duration.", compbasemetrics.ALPHA),
+			Buckets:   valkeyLatencyBuckets,
+		},
+		[]string{"op"},
+	)
+
+	valkeyUp = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_valkey_up",
+			Help:      metricsutil.HelpMsgWithStability("1 when the last Valkey command reached the server, 0 when it failed to. 0 until this replica has reached the server once.", compbasemetrics.ALPHA),
+		},
+	)
+
+	activePeers = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_active_peers",
+			Help:      metricsutil.HelpMsgWithStability("Peer replicas whose values this replica holds in a cached peer aggregate for a state key. A peer drops out when its values expire or its endpoint is deleted.", compbasemetrics.ALPHA),
+		},
+		[]string{"state_key"},
+	)
+
+	peerIndexEntries = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_peer_index_entries",
+			Help:      metricsutil.HelpMsgWithStability("Sequenced elements this replica merged from peer streams into its cached peer aggregates for a state key. A whole-value peer counts as one entry.", compbasemetrics.ALPHA),
+		},
+		[]string{"state_key"},
+	)
+
+	lastSuccessfulSync = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_last_successful_sync_timestamp_seconds",
+			Help:      metricsutil.HelpMsgWithStability("Unix time of the last publication that failed for no endpoint of a state key. time() minus this value is the sync lag.", compbasemetrics.ALPHA),
+		},
+		[]string{"state_key"},
+	)
+
+	streamBudgetBytesPerSecond = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Subsystem: eppmetrics.LLMDRouterEndpointPickerSubsystem,
+			Name:      "redis_syncer_stream_budget_bytes_per_second",
+			Help:      metricsutil.HelpMsgWithStability("Effective per-replica stream byte budget, from maxBytesPerSecond. The publish and read budgets are separate.", compbasemetrics.ALPHA),
+		},
+		[]string{"direction"},
+	)
+
+	// registeredMetrics lists every collector this plugin registers.
+	registeredMetrics = []prometheus.Collector{
+		streamBytes, streamBudgetExhausted, streamResets, streamPeerLag, setBatchDuration,
+		valkeyCommands, valkeyCommandDuration, valkeyUp, activePeers, peerIndexEntries,
+		lastSuccessfulSync, streamBudgetBytesPerSecond,
+	}
 )
 
 // registerMetrics registers the syncer metrics. The vectors are package-level,
 // so a second syncer instance registering them again is a no-op.
 func registerMetrics(registerer prometheus.Registerer) error {
-	for _, collector := range []prometheus.Collector{streamBytes, streamBudgetExhausted, streamResets, streamPeerLag, setBatchDuration} {
+	for _, collector := range registeredMetrics {
 		if err := registerer.Register(collector); err != nil {
 			var alreadyRegistered prometheus.AlreadyRegisteredError
 			if errors.As(err, &alreadyRegistered) && alreadyRegistered.ExistingCollector == collector {
@@ -100,4 +188,118 @@ func registerMetrics(registerer prometheus.Registerer) error {
 
 func observeSetBatch(key fwkdl.StateKey, start time.Time) {
 	setBatchDuration.WithLabelValues(string(key)).Observe(time.Since(start).Seconds())
+}
+
+func observeSuccessfulSync(key fwkdl.StateKey, at time.Time) {
+	lastSuccessfulSync.WithLabelValues(string(key)).Set(float64(at.UnixNano()) / 1e9)
+}
+
+// observeStreamBudget publishes the configured per-replica stream budget.
+func observeStreamBudget(bytesPerSecond int64) {
+	for _, direction := range []string{directionPublish, directionRead} {
+		streamBudgetBytesPerSecond.WithLabelValues(direction).Set(float64(bytesPerSecond))
+	}
+}
+
+// peerGauges maintains activePeers and peerIndexEntries from cache writes
+// instead of by scanning the cache at scrape time. A peer counts once per state
+// key however many endpoints it appears under, so activePeers is the size of
+// the peer set this replica sees.
+type peerGauges struct {
+	mu sync.Mutex
+	// peers maps a state key to the replica IDs its cached aggregates hold and
+	// the number of cached endpoints holding each.
+	peers map[string]map[string]int
+	// entries is how many peer elements the state key's cached aggregates hold.
+	entries map[string]int
+}
+
+func newPeerGauges() *peerGauges {
+	return &peerGauges{peers: map[string]map[string]int{}, entries: map[string]int{}}
+}
+
+// replace moves the bookkeeping of one cached hash key from prev to next. A nil
+// next removes the entry; a nil prev adds one.
+func (g *peerGauges) replace(key fwkdl.StateKey, prev, next *aggregateCacheEntry) {
+	label := string(key)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	counted := g.peers[label]
+	if counted == nil {
+		counted = map[string]int{}
+		g.peers[label] = counted
+	}
+	if prev != nil {
+		for _, id := range prev.peerIDs {
+			if counted[id]--; counted[id] <= 0 {
+				delete(counted, id)
+			}
+		}
+		g.entries[label] -= prev.peerEntries
+	}
+	if next != nil {
+		for _, id := range next.peerIDs {
+			counted[id]++
+		}
+		g.entries[label] += next.peerEntries
+	}
+
+	activePeers.WithLabelValues(label).Set(float64(len(counted)))
+	peerIndexEntries.WithLabelValues(label).Set(float64(g.entries[label]))
+}
+
+// valkeyMetricsHook records what this replica sends to Valkey.
+type valkeyMetricsHook struct{}
+
+func (valkeyMetricsHook) DialHook(next goredis.DialHook) goredis.DialHook {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return next(ctx, network, addr)
+	}
+}
+
+func (valkeyMetricsHook) ProcessHook(next goredis.ProcessHook) goredis.ProcessHook {
+	return func(ctx context.Context, cmd goredis.Cmder) error {
+		start := time.Now()
+		err := next(ctx, cmd)
+		observeValkeyCommand(cmd.Name(), start, err)
+		return err
+	}
+}
+
+func (valkeyMetricsHook) ProcessPipelineHook(next goredis.ProcessPipelineHook) goredis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []goredis.Cmder) error {
+		start := time.Now()
+		err := next(ctx, cmds)
+		for _, cmd := range cmds {
+			// Each command keeps its own error once the pipeline has run, so a
+			// pipeline that failed as a whole still reports per command.
+			observeValkeyCommand(cmd.Name(), start, cmd.Err())
+		}
+		return err
+	}
+}
+
+// observeValkeyCommand counts one command and updates the reachability gauge.
+// A nil reply and an error the server returned both prove the server answered;
+// only a transport failure (dial, read, write, or deadline) means it did not.
+// A command the caller cancelled says nothing about reachability, so it leaves
+// the gauge alone.
+func observeValkeyCommand(op string, start time.Time, err error) {
+	op = strings.ToUpper(op)
+	valkeyCommandDuration.WithLabelValues(op).Observe(time.Since(start).Seconds())
+
+	var redisErr goredis.Error
+	switch {
+	case err == nil, errors.Is(err, goredis.Nil):
+		valkeyCommands.WithLabelValues(op, resultSuccess).Inc()
+		valkeyUp.Set(1)
+	case errors.As(err, &redisErr):
+		valkeyCommands.WithLabelValues(op, resultError).Inc()
+		valkeyUp.Set(1)
+	default:
+		valkeyCommands.WithLabelValues(op, resultError).Inc()
+		if !errors.Is(err, context.Canceled) {
+			valkeyUp.Set(0)
+		}
+	}
 }

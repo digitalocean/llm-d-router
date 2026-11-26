@@ -327,11 +327,13 @@ type peerFetch struct {
 }
 
 type streamRead struct {
-	pub     *publication
-	legacy  []any
-	next    map[string]*streamPeer
-	fetches []*peerFetch
-	changed bool
+	pub    *publication
+	legacy []any
+	// legacyIDs names the replicas of the whole-value peers in legacy.
+	legacyIDs []string
+	next      map[string]*streamPeer
+	fetches   []*peerFetch
+	changed   bool
 }
 
 // readStreams rebuilds the peer aggregate for each publication from the
@@ -354,7 +356,7 @@ func (s *RedisSyncer) readStreams(ctx context.Context, key fwkdl.StateKey, aggre
 				read.changed = true
 			}
 		}
-		peers := s.storeStreamAggregate(read, aggregate)
+		peers := s.storeStreamAggregate(key, read, aggregate)
 		if v := logger.V(logutil.DEBUG); v.Enabled() {
 			v.Info("redis-syncer: Set", "key", string(key), "endpoint", read.pub.endpointID, "replica", s.replicaID, "numReplicas", peers+1)
 		}
@@ -388,6 +390,7 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 				continue
 			}
 			read.legacy = append(read.legacy, value)
+			read.legacyIDs = append(read.legacyIDs, field)
 			continue
 		}
 		m, err := parseMarker(raw[field])
@@ -537,11 +540,11 @@ func decodeEntries(msgs []goredis.XMessage, from, tip uint64) (uint64, [][]byte,
 
 // storeStreamAggregate caches the aggregate of read's peers and returns how
 // many peers it holds. An unchanged peer set keeps the cached aggregate.
-func (s *RedisSyncer) storeStreamAggregate(read *streamRead, aggregate func([]any) any) int {
+func (s *RedisSyncer) storeStreamAggregate(key fwkdl.StateKey, read *streamRead, aggregate func([]any) any) int {
 	hashKey := read.pub.hashKey
 	peers := len(read.next) + len(read.legacy)
 	if peers == 0 {
-		s.cache.Delete(hashKey)
+		s.storeAggregate(key, hashKey, nil)
 		return 0
 	}
 	var value any
@@ -561,7 +564,21 @@ func (s *RedisSyncer) storeStreamAggregate(read *streamRead, aggregate func([]an
 			value = aggregate(values)
 		}
 	}
-	s.cache.Store(hashKey, &aggregateCacheEntry{value: value, streams: read.next, legacyPeers: len(read.legacy)})
+	entry := &aggregateCacheEntry{
+		value:       value,
+		streams:     read.next,
+		legacyPeers: len(read.legacy),
+		peerIDs:     make([]string, 0, peers),
+		peerEntries: len(read.legacy),
+	}
+	for _, id := range slices.Sorted(maps.Keys(read.next)) {
+		entry.peerIDs = append(entry.peerIDs, id)
+		if peer := read.next[id]; peer != nil && peer.value != nil {
+			entry.peerEntries += int(peer.value.SequenceTip() - peer.value.SequenceBase())
+		}
+	}
+	entry.peerIDs = append(entry.peerIDs, read.legacyIDs...)
+	s.storeAggregate(key, hashKey, entry)
 	return peers
 }
 

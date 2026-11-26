@@ -143,6 +143,13 @@ mode, then switch replicas to `incremental`.
 | `redis_syncer_stream_resets_total` | `state_key` | New epochs started by the writer. |
 | `redis_syncer_stream_peer_lag_generations` | `state_key` | Generations a peer read was behind the peer's tip. |
 | `redis_syncer_set_batch_duration_seconds` | `state_key` | Duration of one batched publication. |
+| `redis_syncer_valkey_commands_total` | `op`, `result` | Commands sent to Valkey, by command and outcome (`success`, `error`). A pipeline counts each command in it. |
+| `redis_syncer_valkey_command_duration_seconds` | `op` | Command wall time. Commands sent in one pipeline share its duration. |
+| `redis_syncer_valkey_up` | - | `1` when the last command reached Valkey, `0` when it did not. `0` until the first successful command. |
+| `redis_syncer_active_peers` | `state_key` | Peer replicas this replica holds in a cached peer aggregate. |
+| `redis_syncer_peer_index_entries` | `state_key` | Sequenced elements merged from peer streams; a whole-value peer counts as one. |
+| `redis_syncer_last_successful_sync_timestamp_seconds` | `state_key` | Unix time of the last publication that failed for no endpoint. `time()` minus this is the sync lag. |
+| `redis_syncer_stream_budget_bytes_per_second` | `direction` | Effective per-replica `maxBytesPerSecond`; publish and read budgets are separate. |
 
 Request-level coordination uses separate string keys and `SET NX GET` so the
 first value stored for a request is selected atomically across EPP replicas.
