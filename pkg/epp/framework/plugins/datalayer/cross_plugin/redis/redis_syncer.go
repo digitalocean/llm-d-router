@@ -73,6 +73,8 @@ type RedisSyncer struct {
 	stateTTL        time.Duration
 	coordinationTTL time.Duration
 	cache           sync.Map
+	// peerGauges keeps activePeers and peerIndexEntries in step with cache.
+	peerGauges *peerGauges
 	// incremental publishes SequencedValues as streams instead of whole values.
 	incremental bool
 	// cursors maps a hash key to the streamCursor of this replica's stream.
@@ -88,6 +90,11 @@ type aggregateCacheEntry struct {
 	streams map[string]*streamPeer
 	// legacyPeers is how many whole-value peers the cached aggregate includes.
 	legacyPeers int
+	// peerIDs names the peers the cached aggregate includes, for activePeers.
+	peerIDs []string
+	// peerEntries counts the sequenced elements merged from peers, for
+	// peerIndexEntries. A whole-value peer counts as one.
+	peerEntries int
 }
 
 func parseTTL(name, raw string, defaultValue time.Duration) (time.Duration, error) {
@@ -183,9 +190,14 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 		DB:                    cfg.DB,
 		ContextTimeoutEnabled: true,
 	})
+	client.AddHook(valkeyMetricsHook{})
 	if handle != nil && handle.Context() != nil {
 		context.AfterFunc(handle.Context(), func() { _ = client.Close() })
 	}
+	observeStreamBudget(cfg.MaxBytesPerSecond)
+	// Report unreachable until a command proves otherwise, so a replica that has
+	// never reached Valkey does not look healthy by omitting the series.
+	valkeyUp.Set(0)
 
 	return &RedisSyncer{
 		typedName:       fwkplugin.TypedName{Type: RedisSyncerType, Name: name},
@@ -193,6 +205,7 @@ func RedisSyncerFactory(name string, params *json.Decoder, handle fwkplugin.Hand
 		client:          client,
 		stateTTL:        stateTTL,
 		coordinationTTL: coordinationTTL,
+		peerGauges:      newPeerGauges(),
 		incremental:     incremental,
 		publishBudget:   newByteBudget(cfg.MaxBytesPerSecond),
 		readBudget:      newByteBudget(cfg.MaxBytesPerSecond),
@@ -236,7 +249,8 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 	if err != nil {
 		return fmt.Errorf("redis-syncer: hgetall: %w", err)
 	}
-	peerCount := s.cachePeerAggregate(ctx, hashKey, value, raw, aggregate)
+	peerCount := s.cachePeerAggregate(ctx, key, hashKey, value, raw, aggregate)
+	observeSuccessfulSync(key, time.Now())
 
 	if v := logger.V(logutil.DEBUG); v.Enabled() {
 		v.Info("redis-syncer: Set", "key", string(key), "endpoint", endpointID, "replica", s.replicaID, "numReplicas", peerCount+1)
@@ -244,9 +258,12 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 	return nil
 }
 
-func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, hashKey string, value any, raw map[string]string, aggregate func([]any) any) int {
+// cachePeerAggregate replaces the cached peer aggregate for hashKey and returns
+// how many peers it holds. A hash with no peer value drops the cache entry.
+func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, key fwkdl.StateKey, hashKey string, value any, raw map[string]string, aggregate func([]any) any) int {
 	logger := ctrl.LoggerFrom(ctx)
 	remoteValues := make([]any, 0, len(raw))
+	peerIDs := make([]string, 0, len(raw))
 	for _, field := range slices.Sorted(maps.Keys(raw)) {
 		if field == s.replicaID {
 			continue
@@ -260,15 +277,37 @@ func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, hashKey string, va
 			continue
 		}
 		remoteValues = append(remoteValues, remoteValue)
+		peerIDs = append(peerIDs, field)
 	}
 
-	if len(remoteValues) == 0 {
-		s.cache.Delete(hashKey)
-	} else {
-		s.cache.Store(hashKey, &aggregateCacheEntry{value: aggregate(remoteValues)})
+	var entry *aggregateCacheEntry
+	if len(remoteValues) > 0 {
+		entry = &aggregateCacheEntry{
+			value:       aggregate(remoteValues),
+			peerIDs:     peerIDs,
+			peerEntries: len(remoteValues),
+		}
 	}
+	s.storeAggregate(key, hashKey, entry)
 
 	return len(remoteValues)
+}
+
+// storeAggregate replaces the cached aggregate for hashKey and updates the peer
+// gauges. A nil entry removes the cache entry.
+func (s *RedisSyncer) storeAggregate(key fwkdl.StateKey, hashKey string, entry *aggregateCacheEntry) {
+	var prev *aggregateCacheEntry
+	if v, ok := s.cache.Load(hashKey); ok {
+		prev = v.(*aggregateCacheEntry)
+	}
+	if entry == nil {
+		s.cache.Delete(hashKey)
+	} else {
+		s.cache.Store(hashKey, entry)
+	}
+	if s.peerGauges != nil {
+		s.peerGauges.replace(key, prev, entry)
+	}
 }
 
 func (s *RedisSyncer) Set(ctx context.Context, spec fwkdl.CrossReplicaSpec, endpointID string) error {
@@ -403,13 +442,16 @@ func (s *RedisSyncer) publishChunk(ctx context.Context, key fwkdl.StateKey, aggr
 			reads = append(reads, pub)
 			continue
 		}
-		peerCount := s.cachePeerAggregate(ctx, pub.hashKey, pub.value, pub.result.Val(), aggregate)
+		peerCount := s.cachePeerAggregate(ctx, key, pub.hashKey, pub.value, pub.result.Val(), aggregate)
 		if v := logger.V(logutil.DEBUG); v.Enabled() {
 			v.Info("redis-syncer: Set", "key", string(key), "endpoint", pub.endpointID, "replica", s.replicaID, "numReplicas", peerCount+1)
 		}
 	}
 	if len(reads) > 0 {
 		s.readStreams(ctx, key, aggregate, reads)
+	}
+	if len(failures) == 0 {
+		observeSuccessfulSync(key, time.Now())
 	}
 	return failures
 }
@@ -450,7 +492,7 @@ func (s *RedisSyncer) Get(ctx context.Context, spec fwkdl.CrossReplicaSpec, endp
 
 func (s *RedisSyncer) delete(ctx context.Context, key fwkdl.StateKey, endpointID string) error {
 	hashKey := s.hashKey(key, endpointID)
-	s.cache.Delete(hashKey)
+	s.storeAggregate(key, hashKey, nil)
 	if !s.incremental {
 		return s.client.HDel(ctx, hashKey, s.replicaID).Err()
 	}
