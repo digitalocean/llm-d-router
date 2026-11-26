@@ -18,9 +18,9 @@ package datalayer
 
 // ReplicaCounter is an optional interface for a CrossReplicaSyncer that can
 // count the EPP replicas currently sharing state. A replica counts as live
-// while the store still holds a value it published within its TTL, so the
-// count follows the same heartbeat the syncer already relies on: this replica
-// plus every peer whose fields have not expired.
+// while the store still holds a liveness value it refreshed within its TTL, so
+// the count follows the same heartbeat the syncer already relies on: this
+// replica plus every peer whose liveness has not expired.
 //
 // Consumers use the count to divide a deployment-wide limit across the
 // replicas that will serve requests, such as a dynamic flow-control budget.
@@ -34,19 +34,17 @@ type ReplicaCounter interface {
 	ActiveReplicas() (count int, ok bool)
 }
 
-// PeerLoadReporter is an optional interface for a CrossReplicaSyncer that can
-// say whether the peer values it merges are recent.
+// LocalInFlightLoadReader is an optional interface for a plugin that reports
+// this replica's own in-flight load for one endpoint, excluding anything other
+// replicas published.
 //
-// A consumer that reads a value the syncer already aggregates across replicas
-// should not also divide that value's limit: the aggregate covers the whole
-// deployment, so dividing it would halve capacity that no replica can use. It
-// should divide only while the aggregate is missing or stale, which is what
-// PeerLoadFresh reports.
-type PeerLoadReporter interface {
-	// PeerLoadFresh reports whether the syncer read or merged peer values
-	// within its peer-state TTL. It is a cached read that does not access the
-	// store: it reports false once the TTL passes without a successful
-	// publication, so an unreachable store turns it false without any further
-	// work.
-	PeerLoadFresh() bool
+// A local view is what a limit divided across replicas must be compared
+// against. A CrossReplicaContributor's installed attribute may be replaced with
+// an aggregate across replicas, which is the right input for routing and for a
+// deployment-wide limit, but against a per-replica share it would count peer
+// load as this replica's own and block well below the share.
+type LocalInFlightLoadReader interface {
+	// LocalInFlightLoad returns this replica's own in-flight requests and
+	// tokens for endpointID, which is EndpointMetadata.ID.String().
+	LocalInFlightLoad(endpointID string) (requests, tokens int64)
 }

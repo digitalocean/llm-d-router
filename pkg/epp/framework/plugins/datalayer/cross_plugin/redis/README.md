@@ -266,24 +266,23 @@ quota. Flow control admission across replicas, including fixed per-replica
 shares and the `concurrency-detector` dynamic budget, is described in
 [Multiple active replicas](../../../../../flowcontrol/README.md#multiple-active-replicas).
 
-The syncer reports the replica set to `concurrency-detector` through two
-interfaces, so that budget is sized from the same heartbeat peers are judged by:
+The syncer reports the live replica set to `concurrency-detector` through
+`ReplicaCounter.ActiveReplicas`, so the divided flow-control budget is sized from
+the same heartbeat peers are judged by. It counts the live replicas, this one
+included, using the `refresh:<replica field>` liveness fields described in
+[Peer liveness](#peer-liveness). A retained prefix window from a departed
+replica is not counted, so a long `prefixStateTTL` never inflates the divisor,
+and a hash with no liveness field at all keeps the pre-liveness reading in which
+every replica it names is live. The count is cached and survives a failed
+publication, so an unreachable Valkey leaves each replica on its last share
+instead of widening to the full limit.
 
-- `ReplicaCounter.ActiveReplicas` counts the live replicas, this one included,
-  using the `refresh:<replica field>` liveness fields described in
-  [Peer liveness](#peer-liveness). A retained prefix window from a departed
-  replica is not counted, so a long `prefixStateTTL` never inflates the divisor.
-  A hash with no liveness field at all keeps the pre-liveness reading, in which
-  every replica it names is live.
-- `PeerLoadReporter.PeerLoadFresh` reports whether a hash read succeeded within
-  `inflightStateTTL`, the TTL that expires in-flight accounting. That is the
-  window in which a peer's published load still counts, so it is also the window
-  in which the synced load covers the whole deployment.
-
-Both values are cached. `ActiveReplicas` keeps its last observation across a
-failed publication, and `PeerLoadFresh` turns false once `inflightStateTTL`
-passes without one, so an unreachable Valkey leaves the budget divided at the
-last known count instead of widening to the full limit.
+The load a divided budget is compared against comes from the in-flight load
+producer, not from the syncer: `LocalInFlightLoadReader.LocalInFlightLoad`
+returns that replica's own counters. The attribute this publisher installs
+carries the aggregate across replicas, which routing scorers keep reading
+unchanged; counting it against a per-replica share would charge peer load to this
+replica and block cluster-wide below the budget.
 
 `redis_syncer_active_peers` and the detector's own
 `llm_d_epp_flow_control_budget_replicas` measure different things and are

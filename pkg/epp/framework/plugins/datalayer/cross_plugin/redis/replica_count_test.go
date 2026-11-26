@@ -44,42 +44,6 @@ func ageReplicaObservations(syncer *RedisSyncer, d time.Duration) {
 		syncer.replicas.seen[key] = observation
 	}
 	syncer.replicas.computed = syncer.replicas.computed.Add(-d)
-	syncer.replicas.lastPeerRead.Add(-d.Nanoseconds())
-}
-
-// TestPeerLoadFresh verifies freshness covers a successful read within the
-// in-flight TTL, which is what turns the limit back to a divided share when the
-// store stops answering.
-func TestPeerLoadFresh(t *testing.T) {
-	t.Parallel()
-
-	server := miniredis.RunT(t)
-	syncer := newReplicaCountSyncer(t, server, testReplicaID)
-	ctx := context.Background()
-
-	require.False(t, syncer.PeerLoadFresh(), "no read has happened yet")
-
-	require.NoError(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
-	require.True(t, syncer.PeerLoadFresh(), "a successful read refreshes peer state")
-
-	// A failed publication leaves the last read in place until the TTL passes.
-	server.Close()
-	require.Error(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
-	require.True(t, syncer.PeerLoadFresh(), "the last read is still within the in-flight TTL")
-}
-
-// TestPeerLoadFreshExpires verifies the freshness window is the in-flight TTL.
-func TestPeerLoadFreshExpires(t *testing.T) {
-	t.Parallel()
-
-	server := miniredis.RunT(t)
-	syncer := newReplicaCountSyncer(t, server, testReplicaID)
-
-	syncer.observeReplicas(syncer.hashKey(testStateKey, testEndpointID), map[string]string{testReplicaID: ""})
-	require.True(t, syncer.PeerLoadFresh())
-
-	ageReplicaObservations(syncer, 2*testStateTTL)
-	require.False(t, syncer.PeerLoadFresh(), "a read older than the in-flight TTL is stale")
 }
 
 // TestActiveReplicasUnknownBeforeFirstSet verifies that no count is reported
@@ -346,10 +310,9 @@ func TestActiveReplicasMixedLiveness(t *testing.T) {
 	require.Equal(t, 2, count, "this replica and the one with a liveness field")
 }
 
-// TestReplicaObservationWindowUsesInflightTTL verifies the replica count and
-// peer freshness both use the in-flight TTL, not the longer prefix TTL: a
-// prefix window outliving its replica says nothing about whether its load still
-// counts.
+// TestReplicaObservationWindowUsesInflightTTL verifies the replica count window
+// follows the in-flight TTL, not the longer prefix TTL: a prefix window outliving
+// its replica says nothing about whether that replica still serves.
 func TestReplicaObservationWindowUsesInflightTTL(t *testing.T) {
 	t.Parallel()
 
@@ -363,23 +326,19 @@ func TestReplicaObservationWindowUsesInflightTTL(t *testing.T) {
 	require.NoError(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
 	count, _ := syncer.ActiveReplicas()
 	require.Equal(t, 2, count)
-	require.True(t, syncer.PeerLoadFresh())
 
-	// Past the in-flight TTL both the peer's load and the observation stop
-	// counting, even though the hash and its prefix window would still be
-	// readable on a longer prefix TTL.
+	// Past the in-flight TTL the observation stops counting, even though a
+	// prefix window would still be readable on a longer prefix TTL.
 	ageReplicaObservations(syncer, 2*syncer.inflightTTL())
-	require.False(t, syncer.PeerLoadFresh(), "freshness follows the in-flight TTL")
-
 	server.FastForward(2 * testStateTTL)
 	require.NoError(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
 	count, _ = syncer.ActiveReplicas()
 	require.Equal(t, 1, count)
 }
 
-// TestReplicaObservationFollowsSplitTTLs verifies that with the split-TTL defaults,
-// where inflightStateTTL is far shorter than prefixStateTTL, the freshness window
-// is the short one.
+// TestReplicaObservationFollowsSplitTTLs verifies that with the split-TTL
+// defaults, where inflightStateTTL is far shorter than prefixStateTTL, the
+// observation window is the short one.
 func TestReplicaObservationFollowsSplitTTLs(t *testing.T) {
 	t.Parallel()
 
@@ -390,16 +349,18 @@ func TestReplicaObservationFollowsSplitTTLs(t *testing.T) {
 	require.Equal(t, 2*time.Second, syncer.inflightTTL())
 	require.Equal(t, 10*time.Minute, syncer.prefixTTL())
 
-	syncer.observeReplicas(syncer.hashKey(testStateKey, testEndpointID), map[string]string{
-		testReplicaID:         "",
-		refreshField("epp-b"): refreshValue,
-		"epp-b-window":        "",
-	})
-	require.True(t, syncer.PeerLoadFresh())
+	hashKey := syncer.hashKey(testStateKey, testEndpointID)
+	seedLivePeer(t, syncer, hashKey, "epp-b", syncer.prefixTTL())
+	syncer.observeReplicas(hashKey, rawHash(t, syncer, hashKey))
+	count, _ := syncer.ActiveReplicas()
+	require.Equal(t, 2, count)
 
-	// Older than the in-flight TTL but well inside the prefix TTL.
+	// Older than the in-flight TTL but well inside the prefix TTL, the
+	// observation stops counting.
 	ageReplicaObservations(syncer, 3*time.Second)
-	require.False(t, syncer.PeerLoadFresh(), "freshness expires on the in-flight TTL, not the prefix TTL")
+	syncer.observeReplicas(hashKey, map[string]string{testReplicaID: "", refreshField(testReplicaID): refreshValue})
+	count, _ = syncer.ActiveReplicas()
+	require.Equal(t, 1, count, "the observation window follows the in-flight TTL")
 }
 
 // refreshFields returns the liveness fields present in a hash.

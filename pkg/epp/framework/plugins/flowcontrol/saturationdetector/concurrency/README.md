@@ -54,110 +54,98 @@ The plugin accepts JSON parameters decoding to the following fields:
 - `headroom` (`float64`): Allowed burst capacity above the ideal threshold, expressed as a fraction (e.g., `0.2` for 20%). Must be >= 0.0. (Default: `0.0`)
 - `failOpen` (`bool`): Whether the filter returns all candidates when every candidate is over its limit. When `false` it returns none. (Default: `true`)
 - `inFlightLoadProducerName` (`string`): Name of the `inflight-load-producer` instance to read. Unset selects the instance named `inflight-load-producer`, the name an unnamed instance gets. (Default: unset)
-- `dynamicBudget` (`string`): Whether `maxConcurrency` and `maxTokenConcurrency` are divided across the EPP replicas. One of `off`, `always` or `onPeerLoss`; a JSON bool is also accepted, where `true` means `always`. See [Dynamic budget](#dynamic-budget). (Default: `off`)
+- `dynamicBudget` (`bool`): Divide `maxConcurrency` and `maxTokenConcurrency` across the live EPP replicas, and compare the share against this replica's own in-flight load. See [Dynamic budget](#dynamic-budget). (Default: `false`)
 - `budgetOversubscription` (`float64`): Multiplier on each replica's share when the limit is divided, to tolerate uneven load across replicas. Must be > 0. (Default: `1.0`)
 - `expectedReplicas` (`int`): Replica count the limit is divided by before the cross-replica syncer reports one, such as during a cold start. Must be >= 0; `0` leaves the deployment size unknown. (Default: `0`)
 
 ## Dynamic budget
 
-With N active EPP replicas each enforcing the full `maxConcurrency`, the deployment admits up to N
-times the engine capacity. `dynamicBudget` divides the limit across the replicas at runtime instead.
+With N live EPP replicas each enforcing the full `maxConcurrency`, the deployment admits up to N
+times the engine capacity. `dynamicBudget: true` shares one deployment-wide limit instead:
 
-**Recommendation: use `onPeerLoss` in production HA.** It is correct with the default in-flight
-producer, which syncs load across replicas, and it degrades safely when that sync lapses. `always` is
-for deployments that deliberately keep in-flight load local (`syncCrossReplicaState: false`).
+```
+effective = ceil(global_limit / live_replicas * budgetOversubscription)
+```
 
-### Modes
+and each replica admits that share **of its own in-flight load**. Global 10 over two live replicas is
+5 each. When one replica's liveness expires the survivor's share becomes 10; when it returns, both
+drop back to 5.
 
-| Mode | Behavior | Use when |
-|---|---|---|
-| `off` (default) | The full configured limit applies on every replica. | Single active replica, or a fixed share is configured by hand. |
-| `onPeerLoss` | The **full** limit while peer in-flight load is fresh; the **divided** share while peer load is missing or stale. | Production HA. The in-flight load already includes peers. |
-| `always` | The limit is always divided. | The detector reads load that excludes peers, i.e. `syncCrossReplicaState: false`. |
+### Why the share is measured against local load
 
-The distinction matters because of what the detector compares against. `inflight-load-producer` syncs
-by default: each replica publishes its per-endpoint load through the cross-replica syncer, and the
-value this detector reads is the sum across replicas. With fresh peer values the load therefore
-already covers the whole deployment, and the full deployment-wide limit is the correct comparison.
-Dividing it as well would halve capacity that no replica can use.
+Synced peer load arrives asynchronously. During a burst every replica can admit the full limit before
+it sees the others' admissions, so a synced aggregate compared against a full limit allows up to N
+times the budget. Measuring a per-replica share against the replica's own load bounds the total at
+the deployment-wide limit even while replicas have not seen each other yet.
 
-Peer load stops covering the deployment when peer values are lost or stale: Valkey unreachable, a
-peer aggregate expired, or a cold start before the first publication. Then this replica's load counts
-only itself, and `onPeerLoss` divides the limit by the last known replica count so the survivor does
-not admit for peers that are no longer contributing load. That transition is asymmetric on purpose:
-the limit widens only when peer data is confirmed fresh, and narrows as soon as it is not.
+That is why the detector reads `LocalInFlightLoadReader.LocalInFlightLoad` from the in-flight load
+producer named by `inFlightLoadProducerName`, rather than the endpoint's `InFlightLoad` attribute. The
+cross-replica publisher replaces that attribute with an aggregate across peers, which is the right
+input for routing scorers and for the full limit, but against a share it would count peer load as this
+replica's own: global 10, share 5, replica 1 at 3 and replica 2 at 2 would look full at 5 and block
+cluster-wide far below the budget.
 
-With a single replica the count is 1, so `onPeerLoss` is identical to the full limit either way.
+Routing scorers are unaffected. They keep reading the `InFlightLoad` attribute, which still carries
+the synced aggregate, so `token-load-scorer`, `active-request-scorer` and the rest keep the
+deployment-wide view. With `dynamicBudget: false` the detector also reads that attribute, exactly as
+before.
 
-`always` is rejected at startup when the in-flight producer syncs across replicas and a syncer is
-configured, because that combination is exactly the double-division case. The check runs on the
-detector's first evaluation, since neither the syncer nor an auto-created producer exists when the
-plugin is constructed: the detector logs once at error level and falls back to the full limit.
+### Trade-off: early shedding under imbalance
+
+A replica caps at its share even while another replica sits idle, so traffic that is unevenly spread
+across replicas waits in a queue while the pool has spare capacity. This is deliberate: the
+alternative lets every replica admit the full limit during the sync lag and overshoots the budget by
+up to N times. `budgetOversubscription` above 1.0 trades some of that headroom back.
+
+### Replica count
+
+`live_replicas` comes from the `CrossReplicaSyncer` configured as
+`dataLayer.crossReplica.syncerPluginRef`. With `redis-syncer` it counts the replicas that hold a
+`refresh:<replica field>` liveness field, which every replica rewrites with `inflightStateTTL` on each
+publication tick. A peer leaves the count when that field expires, and joins it when it first
+publishes. The liveness field matters because prefix windows are retained past the replica that wrote
+them, on the much longer `prefixStateTTL`: counting value fields alone would keep a departed replica
+in the divisor for up to ten minutes after its load stopped counting, shrinking every survivor's
+share for a replica that takes no traffic. A hash with no liveness field at all predates the field
+and is read as before, with every replica it names counting. This replica always counts itself.
+
+- **No replica count yet.** Before the first successful publication the limit is divided by
+  `expectedReplicas` when set, else kept at the full global limit. Set `expectedReplicas` to the
+  steady-state replica count so a cold start does not over-admit for one publication cycle.
+- **Store unreachable.** The syncer keeps reporting its last count, so each replica keeps its share.
+  It never widens to the global limit, which would over-admit, and never drops to zero.
+- **Rounding.** Shares round up, so the replicas together never fall short of the global limit
+  through rounding. `budgetOversubscription` above 1.0 deliberately admits past it to absorb skew.
 
 ### Configuration
 
 ```yaml
 - type: concurrency-detector
   parameters:
-    maxConcurrency: 64            # deployment-wide requests
+    maxConcurrency: 10            # deployment-wide requests
     maxTokenConcurrency: 352000   # deployment-wide tokens
-    dynamicBudget: onPeerLoss
+    dynamicBudget: true
     budgetOversubscription: 1.0
     expectedReplicas: 2           # cold-start divisor until a count is known
 ```
 
-```
-effective = ceil(global_limit / active_replicas * budgetOversubscription)
-```
-
-The formula applies to both the request and token limits, and the result drives pool saturation and
-the per-endpoint filter exactly as a configured limit would.
-
-### Replica count and peer freshness
-
-Both come from the `CrossReplicaSyncer` configured as `dataLayer.crossReplica.syncerPluginRef`.
-
-`active_replicas` is the syncer's replica heartbeat. With `redis-syncer` it counts the replicas that
-hold a `refresh:<replica field>` liveness field, which every replica rewrites with `inflightStateTTL`
-on each publication tick. A peer leaves the count when that field expires, and joins it when it first
-publishes. The liveness field matters because prefix windows are retained past the replica that wrote
-them, on the much longer `prefixStateTTL`: counting value fields alone would keep a departed replica
-in the divisor for up to ten minutes after its load stopped counting, shrinking every survivor's
-share for a replica that takes no traffic. A hash with no liveness field at all predates the field
-and is read as before, with every replica it names counting.
-
-Peer freshness is whether the syncer completed a hash read, and so refreshed its view of peer state,
-within `inflightStateTTL` — the TTL after which a peer's in-flight load expires. That is the right
-window because it is the window in which the peer load this detector compares against is complete; a
-retained prefix window says nothing about whether its replica's load still counts. A publication
-cycle that fails for longer than the in-flight TTL leaves the aggregate with neither live peers nor a
-recent read. Freshness is a cached value with no store access on the evaluation path.
-
-A configuration that sets only `stateTTL` uses it for both, so it behaves as before; one relying on
-the `inflightStateTTL` default detects peer loss within about two seconds.
-
-- **No replica count yet.** Before the first successful publication the limit is divided by
-  `expectedReplicas` when set, else kept at the full global limit. Set `expectedReplicas` to the
-  steady-state replica count so a cold start does not over-admit for one publication cycle.
-- **Store unreachable.** The syncer keeps reporting its last count, so the divided share stays at the
-  last known replica count. It never widens to the global limit, which would over-admit, and never
-  drops to zero.
-- **Rounding.** Shares round up, so the replicas together never fall short of the global limit
-  through rounding. `budgetOversubscription` above 1.0 deliberately admits past it to absorb skew.
+Point the detector at a producer that reports local load, which `inflight-load-producer` does. A
+producer without that capability leaves the detector on the attribute the cross-replica publisher may
+have replaced, and the detector logs once at startup saying so.
 
 Metrics, labeled by the detector name:
 
 | Metric | Meaning |
 |---|---|
-| `llm_d_epp_flow_control_effective_request_budget` | Request limit enforced on this replica. |
-| `llm_d_epp_flow_control_effective_token_budget` | Token limit enforced on this replica. |
-| `llm_d_epp_flow_control_budget_replicas` | Replica count the limit was divided by; `1` when the full limit is in force. |
-| `llm_d_epp_flow_control_budget_divided` | `1` when the divided share is enforced, `0` when the full limit is used. |
+| `llm_d_epp_flow_control_effective_request_budget` | Requests this replica may have in flight. |
+| `llm_d_epp_flow_control_effective_token_budget` | Tokens this replica may have in flight. |
+| `llm_d_epp_flow_control_budget_replicas` | Live replica count the limit was divided by; `1` when the full limit is in force. |
+| `llm_d_epp_flow_control_local_inflight_requests` | Requests in flight on this replica that the detector counts. |
+| `llm_d_epp_flow_control_local_inflight_tokens` | Tokens in flight on this replica that the detector counts. |
 
-With `dynamicBudget: off`, the metrics report the configured limits, `1`, and `0`, and the detector's
-behavior is unchanged. With `onPeerLoss`, `llm_d_epp_flow_control_budget_divided` is the signal to
-alert on: a sustained `1` means peer in-flight load has not been refreshed for longer than
-`inflightStateTTL`.
+With `dynamicBudget: false` the effective budgets report the configured limits, `budget_replicas`
+reports `1`, and the local-load gauges stay at 0: the detector reads the attribute map and nothing is
+divided.
 
 `llm_d_epp_flow_control_budget_replicas` and `redis-syncer`'s `redis_syncer_active_peers` both count
 replicas but are not the same series, and their values differ by one by design:

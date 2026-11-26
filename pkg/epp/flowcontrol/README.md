@@ -175,31 +175,34 @@ Fixed shares have these costs:
 
 #### Dynamic budget
 
-Instead of dividing the limit by hand, set `dynamicBudget: onPeerLoss` on `concurrency-detector`. It
-keeps the deployment-wide `maxConcurrency` and `maxTokenConcurrency` in configuration and divides
-them at runtime by the replica count reported by the `CrossReplicaSyncer`, but **only while peer
-in-flight load is missing or stale**. While peer load is fresh it enforces the full limit, because
-the synced load already covers the deployment.
+Instead of dividing the limit by hand, set `dynamicBudget: true` on `concurrency-detector`. It keeps
+the deployment-wide `maxConcurrency` and `maxTokenConcurrency` in configuration and shares them across
+the live replicas at runtime:
 
 ```
-effective = ceil(global_limit / active_replicas * budgetOversubscription)   # only on peer loss
+effective = ceil(global_limit / live_replicas * budgetOversubscription)
 ```
 
-`redis-syncer` reports both the replica count and peer freshness from the same per-replica state it
-already uses to share endpoint data. The count follows the `refresh:<replica field>` liveness field,
-which expires on `inflightStateTTL`, so a peer leaves the count when its heartbeat expires and joins
-it when it first publishes — a prefix window retained on the longer `prefixStateTTL` does not keep a
-departed replica in the divisor. Peer freshness uses the same in-flight TTL.
-`expectedReplicas` divides the limit before the first count is known, and an unreachable store keeps
-the last computed share. See the
+Each replica admits that share **of its own in-flight load**. Global 10 over two live replicas is 5
+each; when one replica departs, the survivor's share becomes 10 on the next liveness expiry, and when
+it returns both drop back to 5. `redis-syncer` supplies the count from the `refresh:<replica field>`
+liveness field, which expires on `inflightStateTTL`, so a retained prefix window does not keep a
+departed replica in the divisor. `expectedReplicas` divides the limit before the first count is known,
+and an unreachable store keeps the last share.
+
+This is the recommended configuration for production HA. It bounds cluster-wide admission even during
+a burst: synced peer load arrives late, so with the full limit on every replica each can admit the
+whole budget before seeing the others, and the deployment can reach N times it. A per-replica share
+measured against local load cannot. The price is early shedding when traffic is unevenly spread — a
+replica caps at its share while another sits idle — which `budgetOversubscription` can partly offset.
+
+The detector reads the in-flight load producer's own counters through
+`LocalInFlightLoadReader.LocalInFlightLoad` rather than the endpoint's `InFlightLoad` attribute, which
+the cross-replica publisher replaces with the aggregate across peers. Leave
+`syncCrossReplicaState` at its default (`true`): the aggregate still feeds the routing scorers, which
+are unchanged, while the divided budget is measured against local load. See the
 [concurrency detector](../framework/plugins/flowcontrol/saturationdetector/concurrency/README.md#dynamic-budget)
-for the mode table, the details and the budget metrics.
-
-**This is the recommended configuration for production HA**, because it is correct with the default
-`inflight-load-producer` settings. Leave `syncCrossReplicaState` at its default (`true`): with fresh
-peer values the full limit is right, and when sync lapses the share takes over. `dynamicBudget:
-always` is only for a producer with `syncCrossReplicaState: false`, and is rejected at startup when
-both sync and a syncer are configured.
+for the details and the budget metrics.
 
 ### High Level Architecture
 

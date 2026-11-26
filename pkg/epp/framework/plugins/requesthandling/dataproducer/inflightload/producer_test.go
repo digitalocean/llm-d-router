@@ -286,6 +286,43 @@ func TestInFlightLoadProducer_Extract(t *testing.T) {
 	require.Equal(t, int64(500), load2.Tokens)
 }
 
+func TestInFlightLoadProducer_CrossReplicaAggregateLeavesLocalLoadLocal(t *testing.T) {
+	t.Parallel()
+
+	producer := newTestProducer(t)
+	ctx := context.Background()
+	endpointName := "cross-replica-endpoint"
+	endpointID := fullEndpointName(endpointName)
+
+	// This replica admits two requests, which its own trackers count.
+	req := makeTokenRequest("req1", 4)
+	res := makeSchedulingResult(endpointName)
+	_ = producer.PreRequest(ctx, req, res)
+	_ = producer.PreRequest(ctx, req, res)
+
+	localRequests, localTokens := producer.LocalInFlightLoad(endpointID)
+	require.Equal(t, int64(2), localRequests)
+	require.Equal(t, int64(2)*(int64(4)+UnknownOutputTokens), localTokens)
+
+	// A peer reports its own load. The contributor's aggregate is what routing
+	// scorers read through the installed attribute, and it must include the peer
+	// so scorers keep the deployment-wide view.
+	spec := producer.CrossReplicaState()
+	require.False(t, spec.SyncDisabled, "the test producer syncs by default")
+	aggregate := spec.Aggregate([]any{
+		spec.Read(endpointID),
+		&attrconcurrency.InFlightLoad{Requests: 3, Tokens: 30},
+	}).(*attrconcurrency.InFlightLoad)
+	require.Equal(t, int64(5), aggregate.Requests, "scorers see this replica plus the peer")
+	require.Equal(t, localTokens+30, aggregate.Tokens)
+
+	// The local reader the detector uses is unchanged: peer load never leaks into
+	// the per-replica counters a divided budget is compared against.
+	localRequests, localTokens = producer.LocalInFlightLoad(endpointID)
+	require.Equal(t, int64(2), localRequests, "peer load must not raise this replica's own count")
+	require.Equal(t, int64(2)*(int64(4)+UnknownOutputTokens), localTokens)
+}
+
 func TestInFlightLoadProducer_Lifecycle(t *testing.T) {
 	t.Parallel()
 

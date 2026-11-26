@@ -987,10 +987,11 @@ These metrics are owned by the EPP Flow Control layer.
 | `llm_d_epp_flow_control_queue_bytes` | Gauge | `fairness_id`, `priority`, `inference_pool`, `model_name`, `target_model_name` | Bytes currently held in the queue. |
 | `llm_d_epp_flow_control_pool_saturation` | Gauge | `inference_pool`, `stage` | Saturation signal used to gate dispatch. |
 | `llm_d_epp_flow_control_stale_endpoints` | Gauge | `detector`, `stage` | Candidate endpoints with missing or stale metrics. |
-| `llm_d_epp_flow_control_effective_request_budget` | Gauge | `detector` | Request limit `concurrency-detector` enforces on this replica. |
-| `llm_d_epp_flow_control_effective_token_budget` | Gauge | `detector` | Token limit `concurrency-detector` enforces on this replica. |
-| `llm_d_epp_flow_control_budget_replicas` | Gauge | `detector` | EPP replicas the divided flow-control budget uses; `1` when the full limit is in force. |
-| `llm_d_epp_flow_control_budget_divided` | Gauge | `detector` | `1` when the divided share is enforced, `0` when the full limit is used. |
+| `llm_d_epp_flow_control_effective_request_budget` | Gauge | `detector` | Requests this replica may have in flight. |
+| `llm_d_epp_flow_control_effective_token_budget` | Gauge | `detector` | Tokens this replica may have in flight. |
+| `llm_d_epp_flow_control_budget_replicas` | Gauge | `detector` | Live EPP replicas the budget was divided by; `1` when the full limit is in force. |
+| `llm_d_epp_flow_control_local_inflight_requests` | Gauge | `detector` | Requests in flight on this replica that the detector counts. |
+| `llm_d_epp_flow_control_local_inflight_tokens` | Gauge | `detector` | Tokens in flight on this replica that the detector counts. |
 | `llm_d_epp_flow_control_detector_saturation` | Gauge | `detector`, `stage` | Saturation reported by each child of a `max-saturation-detector`, from its most recent evaluation. `stage` is `prefill`, `decode`, or empty when the pool has no endpoints. |
 | `llm_d_epp_flow_control_capacity_utilization_requests` | Gauge | `priority`, `inference_pool` | Per-priority-band request capacity use. |
 | `llm_d_epp_flow_control_capacity_utilization_bytes` | Gauge | `priority`, `inference_pool` | Per-priority-band byte capacity use. |
@@ -1077,45 +1078,56 @@ These metrics are owned by the EPP Flow Control layer.
 
 *   **Type:** Gauge
 *   **Labels:** `detector`
-*   **Description:** Request limit the `concurrency-detector` enforces on this replica. Equals
-    `maxConcurrency` when `dynamicBudget` is `off`, or when it is `onPeerLoss` and peer in-flight load
-    is fresh; otherwise it is `ceil(maxConcurrency / active_replicas * budgetOversubscription)`, where
-    `active_replicas` counts this replica and the peers its cross-replica syncer still holds a
-    heartbeat for.
-*   **Usage:** Compare against the sum across replicas to verify the deployment-wide budget is not
-    over- or under-admitted. Pair with `llm_d_epp_flow_control_budget_divided` to tell the full limit
-    from a share that happens to equal it.
+*   **Description:** Requests this replica may have in flight. Equals `maxConcurrency` when
+    `dynamicBudget` is false; otherwise it is `ceil(maxConcurrency / live_replicas *
+    budgetOversubscription)`, where `live_replicas` counts this replica and the peers its
+    cross-replica syncer still holds a liveness field for.
+*   **Usage:** The bound the detector compares this replica's own in-flight requests against. Sum it
+    across replicas to confirm the deployment-wide budget is respected; the shares add up to it
+    through rounding up. With `dynamicBudget` true, a replica reaches this value on its own load even
+    if peers are idle, which is the accepted early-shedding trade-off.
 
 #### `llm_d_epp_flow_control_effective_token_budget`
 
 *   **Type:** Gauge
 *   **Labels:** `detector`
-*   **Description:** Token limit the `concurrency-detector` enforces on this replica, the
-    `maxTokenConcurrency` counterpart of `llm_d_epp_flow_control_effective_request_budget`.
+*   **Description:** Tokens this replica may have in flight, the `maxTokenConcurrency` counterpart of
+    `llm_d_epp_flow_control_effective_request_budget`.
 *   **Usage:** Same as `llm_d_epp_flow_control_effective_request_budget`, for token accounting.
 
 #### `llm_d_epp_flow_control_budget_replicas`
 
 *   **Type:** Gauge
 *   **Labels:** `detector`
-*   **Description:** Number of active EPP replicas the flow-control budget was divided by, as counted
-    from cross-replica heartbeats. Reports `1` when the full deployment-wide limit is in force, which
-    includes `dynamicBudget: off`, a single replica, and `onPeerLoss` with fresh peer load.
+*   **Description:** Number of live EPP replicas the flow-control budget was divided by, counted from
+    cross-replica liveness. Reports `1` when the full deployment-wide limit is in force, which
+    includes `dynamicBudget: false` and a single live replica.
 *   **Usage:** An unchanged value while replicas are added or removed indicates the cross-replica
-    syncer is not reporting a count, and every replica is still admitting its last share.
+    syncer is not reporting a count, and every replica is still admitting its last share. Its value is
+    one more than `redis_syncer_active_peers`, which excludes this replica.
 
-#### `llm_d_epp_flow_control_budget_divided`
+#### `llm_d_epp_flow_control_local_inflight_requests`
 
 *   **Type:** Gauge
 *   **Labels:** `detector`
-*   **Description:** Whether the flow-control limit is currently divided across replicas: `1` when the
-    per-replica share is enforced, `0` when the full deployment-wide limit is in use. With
-    `dynamicBudget: onPeerLoss`, `1` means peer in-flight load is missing or stale and this replica is
-    covering the deployment-wide limit alone.
-*   **Usage:** The primary signal for `onPeerLoss`. A sustained `1` means the cross-replica syncer has
-    not completed a read within `inflightStateTTL`: Valkey is unreachable, its credentials or address
-    are wrong, or publication is failing. Alerts fired on a short-lived `1` during a burst double count
-    the brief sync lag; use a duration long enough to exclude a few publication cycles.
+*   **Description:** Requests in flight on this replica that the `concurrency-detector` counted in its
+    most recent saturation evaluation, summed over the candidate endpoints. With `dynamicBudget` true
+    this is this replica's own load, read from the in-flight load producer's counters, and excludes
+    peers — the value the divided request budget is compared against. With it false the gauge stays at
+    0, because the detector reads the endpoint attribute map instead.
+*   **Usage:** Divide by `llm_d_epp_flow_control_effective_request_budget` to see how full this
+    replica's share is. It is also the series an over-admission test watches: with two replicas each at
+    their share, the cluster total is the deployment-wide budget even when neither sees the other.
+
+#### `llm_d_epp_flow_control_local_inflight_tokens`
+
+*   **Type:** Gauge
+*   **Labels:** `detector`
+*   **Description:** Tokens in flight on this replica that the `concurrency-detector` counted in its
+    most recent saturation evaluation, the token counterpart of
+    `llm_d_epp_flow_control_local_inflight_requests`.
+*   **Usage:** Compare against `llm_d_epp_flow_control_effective_token_budget` to see how full this
+    replica's token share is.
 
 #### `llm_d_epp_flow_control_capacity_utilization_requests`
 

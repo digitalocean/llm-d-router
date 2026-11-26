@@ -31,14 +31,10 @@ type replicaObservation struct {
 }
 
 // replicaCounts tracks the live replica count across the endpoint hashes this
-// replica reads, and when a read last merged peer values. See observeReplicas
-// and PeerLoadFresh.
+// replica reads. See observeReplicas.
 type replicaCounts struct {
 	// active is the count ActiveReplicas reports.
 	active atomic.Int64
-	// lastPeerRead is when this replica last read or merged peer values, in
-	// unix nanoseconds. It is what PeerLoadFresh compares against.
-	lastPeerRead atomic.Int64
 
 	mu sync.Mutex
 	// seen is the last observation of each endpoint's hash, keyed by hash key.
@@ -48,24 +44,8 @@ type replicaCounts struct {
 	computed time.Time
 }
 
-// PeerLoadFresh implements fwkdl.PeerLoadReporter. Peer values count as fresh
-// while a hash read succeeded within the in-flight TTL, the TTL after which a
-// peer's own in-flight value expires: a publication cycle that fails for longer
-// than that leaves the aggregate with neither live peers nor a recent read.
-//
-// The in-flight TTL is the right window rather than the prefix TTL. What this
-// reports is whether the peer load the detector compares against is complete,
-// and only in-flight accounting expires on that short TTL. A retained prefix
-// window outliving its replica on the prefix TTL says nothing about whether
-// that replica's load still counts.
-func (s *RedisSyncer) PeerLoadFresh() bool {
-	last := s.replicas.lastPeerRead.Load()
-	return last != 0 && time.Since(time.Unix(0, last)) <= s.inflightTTL()
-}
-
 // observeReplicas records how many replicas the read of one endpoint's hash
-// found live, this replica included, and marks the read as the latest refresh of
-// peer state.
+// found live, this replica included.
 //
 // Replicas are counted from the per-replica liveness fields, by the same
 // liveSet readers use, rather than from the value fields alone. Prefix windows
@@ -87,7 +67,6 @@ func (s *RedisSyncer) PeerLoadFresh() bool {
 func (s *RedisSyncer) observeReplicas(hashKey string, raw map[string]string) {
 	now := time.Now()
 	count := int64(s.liveReplicas(raw))
-	s.replicas.lastPeerRead.Store(now.UnixNano())
 
 	window := s.inflightTTL()
 	s.replicas.mu.Lock()

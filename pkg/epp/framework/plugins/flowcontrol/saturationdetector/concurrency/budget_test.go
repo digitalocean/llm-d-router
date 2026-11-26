@@ -18,7 +18,7 @@ package concurrency
 
 import (
 	"context"
-	"encoding/json"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -26,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"k8s.io/utils/ptr"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
@@ -34,63 +35,85 @@ import (
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
 )
 
-// fakeBudgetSource is a budgetSource whose count and peer freshness the test
-// drives.
-type fakeBudgetSource struct {
-	replicas atomic.Int64
-	known    atomic.Bool
-	fresh    atomic.Bool
+// fakeReplicaCounter is a ReplicaCounter whose count the test drives.
+type fakeReplicaCounter struct {
+	count atomic.Int64
+	ok    atomic.Bool
 }
 
-func (s *fakeBudgetSource) ActiveReplicas() (int, bool) {
-	return int(s.replicas.Load()), s.known.Load()
+func (c *fakeReplicaCounter) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "fake-syncer", Name: "fake-syncer"}
 }
 
-func (s *fakeBudgetSource) peerLoadFresh() bool { return s.fresh.Load() }
+func (c *fakeReplicaCounter) ActiveReplicas() (int, bool) { return int(c.count.Load()), c.ok.Load() }
 
-// report makes the source report count replicas with the given peer freshness.
-func (s *fakeBudgetSource) report(count int, fresh bool) *fakeBudgetSource {
-	s.replicas.Store(int64(count))
-	s.known.Store(true)
-	s.fresh.Store(fresh)
-	return s
+// report makes the counter report count as a known value.
+func (c *fakeReplicaCounter) report(count int) *fakeReplicaCounter {
+	c.count.Store(int64(count))
+	c.ok.Store(true)
+	return c
 }
 
-// loseMakes the source lose its count, as a syncer with no observation does.
-func (s *fakeBudgetSource) loseCount() {
-	s.replicas.Store(0)
-	s.known.Store(false)
-	s.fresh.Store(false)
+// loseCount makes the counter report no count, as a syncer whose store is
+// unreachable does.
+func (c *fakeReplicaCounter) loseCount() {
+	c.count.Store(0)
+	c.ok.Store(false)
 }
 
-// staleMakes peer values stale while keeping the last count, as an unreachable
-// store does.
-func (s *fakeBudgetSource) stale() {
-	s.fresh.Store(false)
+// fakeLoadReader is a LocalInFlightLoadReader whose per-endpoint counters the
+// test drives. It stands in for the in-flight load producer's own trackers.
+type fakeLoadReader struct {
+	mu   sync.Mutex
+	load map[string]*attrconcurrency.InFlightLoad
+}
+
+func newFakeLoadReader() *fakeLoadReader {
+	return &fakeLoadReader{load: map[string]*attrconcurrency.InFlightLoad{}}
+}
+
+func (r *fakeLoadReader) LocalInFlightLoad(endpointID string) (requests, tokens int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if load, ok := r.load[endpointID]; ok {
+		return load.Requests, load.Tokens
+	}
+	return 0, 0
+}
+
+func (r *fakeLoadReader) set(endpointName string, requests, tokens int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.load[fullEndpointName(endpointName)] = &attrconcurrency.InFlightLoad{Requests: requests, Tokens: tokens}
 }
 
 // dynamicTestConfig returns a config for a deployment-wide budget of 64
-// requests and 352000 tokens in the given mode.
-func dynamicTestConfig(mode budgetMode, oversubscription float64, expectedReplicas int) config {
+// requests and 352000 tokens, divided when divide is true.
+func dynamicTestConfig(divide bool, oversubscription float64, expectedReplicas int) config {
 	return config{
 		mode:                   modeRequests,
 		maxConcurrency:         64,
 		maxTokenConcurrency:    352000,
-		budgetMode:             mode,
+		dynamicBudget:          divide,
 		budgetOversubscription: oversubscription,
 		expectedReplicas:       expectedReplicas,
 	}
 }
 
-// newBudgetDetector builds a detector with a budget whose scope is already
-// resolved. peerLoad is the in-flight load scope the test wants.
-func newBudgetDetector(t *testing.T, name string, cfg config, source budgetSource, peerLoad peerLoadScope) *detector {
+// newBudgetDetector builds a detector with a budget and a replica source.
+func newBudgetDetector(t *testing.T, name string, cfg config, source *fakeReplicaCounter) *detector {
 	t.Helper()
 	detector := newDetector(name, cfg, logr.Discard())
 	require.NotNil(t, detector.budget)
 	detector.budget.setSource(source)
-	detector.budget.setPeerLoadScope(peerLoad)
 	return detector
+}
+
+// withLocalLoad supplies a local load reader directly, as the detector would
+// resolve one from the in-flight load producer.
+func (d *detector) withLocalLoad(reader datalayer.LocalInFlightLoadReader) *detector {
+	d.localLoad.Store(&reader)
+	return d
 }
 
 func TestEffectiveLimit(t *testing.T) {
@@ -123,9 +146,9 @@ func TestEffectiveLimit(t *testing.T) {
 	}
 }
 
-// TestBudget_Always verifies `always` divides the limits for every replica
-// count, for both dimensions.
-func TestBudget_Always(t *testing.T) {
+// TestBudget_ReplicaCounts verifies the per-replica limits for one, two and
+// three live replicas.
+func TestBudget_ReplicaCounts(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -142,8 +165,8 @@ func TestBudget_Always(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			detector := newBudgetDetector(t, "budget-always-"+tc.name, dynamicTestConfig(budgetAlways, 1.0, 0),
-				(&fakeBudgetSource{}).report(tc.replicas, false), peerLoadLocal)
+			detector := newBudgetDetector(t, "budget-"+tc.name, dynamicTestConfig(true, 1.0, 0),
+				(&fakeReplicaCounter{}).report(tc.replicas))
 
 			requests, tokens := detector.limits()
 			require.Equal(t, tc.wantRequests, requests)
@@ -152,104 +175,141 @@ func TestBudget_Always(t *testing.T) {
 	}
 }
 
-// TestBudget_OnPeerLoss_FreshPeersKeepFullLimit verifies the production mode
-// leaves the full deployment-wide limit in force while peer load is fresh: the
-// aggregate already covers every replica, so dividing as well would halve
-// capacity.
-func TestBudget_OnPeerLoss_FreshPeersKeepFullLimit(t *testing.T) {
+// TestBudget_PeerLoadDoesNotCountAgainstTheShare is the core of the design: two
+// replicas each admit up to their own share of their own load, and neither
+// replica's share is consumed by the other's load. Counting peer load against a
+// per-replica share would block cluster-wide well below the budget.
+func TestBudget_PeerLoadDoesNotCountAgainstTheShare(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(2, true)
-	detector := newBudgetDetector(t, "budget-peer-fresh", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadSynced)
+	const (
+		global = 10
+		share  = 5
+	)
+	cfg := config{
+		mode:                   modeRequests,
+		maxConcurrency:         global,
+		maxTokenConcurrency:    1000,
+		dynamicBudget:          true,
+		budgetOversubscription: 1,
+	}
 
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(64), requests, "fresh peer load covers the deployment, so the full limit applies")
-	require.Equal(t, int64(352000), tokens)
-	require.Equal(t, 0.0, promtestutil.ToFloat64(budgetDivided.WithLabelValues("budget-peer-fresh")))
-	require.Equal(t, 1.0, promtestutil.ToFloat64(budgetReplicas.WithLabelValues("budget-peer-fresh")),
-		"the replica gauge reports 1 when nothing is divided")
-}
+	// The syncer counts two live replicas, so each enforces half the budget.
+	source := (&fakeReplicaCounter{}).report(2)
 
-// TestBudget_OnPeerLoss_StoreDownDividesByLastCount verifies an unreachable
-// store divides the limit by the last known replica count, and recovery
-// restores the full limit.
-func TestBudget_OnPeerLoss_StoreDownDividesByLastCount(t *testing.T) {
-	t.Parallel()
-
-	source := (&fakeBudgetSource{}).report(2, true)
-	detector := newBudgetDetector(t, "budget-peer-loss", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadSynced)
+	// Replica 1 has 3 of its own requests in flight; replica 2 has 2. Together
+	// those are 5, the share, but this replica's own load is only 3, so it has
+	// room for 2 more.
+	reader := newFakeLoadReader()
+	reader.set("endpoint-a", 3, 30)
+	detector := newBudgetDetector(t, "budget-peer-load", cfg, source).withLocalLoad(reader)
 
 	requests, _ := detector.limits()
-	require.Equal(t, int64(64), requests)
+	require.Equal(t, int64(share), requests)
 
-	// The store becomes unreachable: peer values are stale and this replica's
-	// load no longer counts the peer, so it covers the deployment alone.
-	source.stale()
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(32), requests, "the limit is divided by the last known replica count")
-	require.Equal(t, int64(176000), tokens)
-	require.Equal(t, 1.0, promtestutil.ToFloat64(budgetDivided.WithLabelValues("budget-peer-loss")))
-	require.Equal(t, 2.0, promtestutil.ToFloat64(budgetReplicas.WithLabelValues("budget-peer-loss")))
+	ctx := context.Background()
+	reg := newLocalRegistry()
+	// The endpoint's installed attribute holds the cross-replica aggregate of
+	// 3 + 2 = 5, which would look full against a share of 5.
+	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) {
+		load.Requests = 3 + 2
+	})
 
-	// The store recovers: peer load is fresh again and the full limit returns.
-	source.report(2, true)
-	requests, tokens = detector.limits()
-	require.Equal(t, int64(64), requests, "recovery restores the full limit")
-	require.Equal(t, int64(352000), tokens)
-	require.Equal(t, 0.0, promtestutil.ToFloat64(budgetDivided.WithLabelValues("budget-peer-loss")))
+	endpoint := newFakeEndpoint(reg, "endpoint-a")
+	saturation := detector.Saturation(ctx, []datalayer.Endpoint{endpoint})
+	require.InDelta(t, 3.0/5.0, saturation, 1e-9,
+		"saturation must use this replica's own load of 3, not the aggregate of 5")
+
+	// The local load the budget is compared against is visible.
+	require.Equal(t, 3.0, promtestutil.ToFloat64(localRequestLoad.WithLabelValues("budget-peer-load")))
+
+	// Own load of 3 is under the share of 5, so the endpoint stays schedulable.
+	kept := detector.Filter(ctx, nil, []fwksched.Endpoint{newStubSchedulingEndpoint(reg, "endpoint-a")})
+	require.Len(t, kept, 1, "the aggregate 5 must not close the endpoint against a share of 5")
 }
 
-// TestBudget_OnPeerLoss_SingleReplica verifies a single replica always enforces
-// the full limit, fresh peers or not.
-func TestBudget_OnPeerLoss_SingleReplica(t *testing.T) {
+// TestBudget_EachReplicaCappedAtItsShare verifies two replicas together cannot
+// exceed the deployment-wide budget even though neither sees the other's
+// admissions yet. Each replica admits against its own load only, so both stop at
+// the share and the total is the global limit.
+func TestBudget_EachReplicaCappedAtItsShare(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(1, true)
-	detector := newBudgetDetector(t, "budget-peer-single", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadSynced)
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(64), requests)
-	require.Equal(t, int64(352000), tokens)
+	const (
+		global = 10
+		share  = 5
+	)
+	cfg := config{
+		mode:                   modeRequests,
+		maxConcurrency:         global,
+		maxTokenConcurrency:    1000,
+		dynamicBudget:          true,
+		budgetOversubscription: 1,
+	}
+	ctx := context.Background()
 
-	source.stale()
-	requests, tokens = detector.limits()
-	require.Equal(t, int64(64), requests, "dividing by one replica is the full limit")
-	require.Equal(t, int64(352000), tokens)
+	var admitted [2]int64
+	for i := range admitted {
+		// This replica sees two live replicas and no peer admissions yet: the
+		// peer's load is invisible to it during the burst. Its own counters are
+		// the only load that counts against its share.
+		reader := newFakeLoadReader()
+		detector := newBudgetDetector(t, "budget-capped", cfg, (&fakeReplicaCounter{}).report(2)).withLocalLoad(reader)
+		reg := newLocalRegistry()
+
+		for {
+			endpoint := newFakeEndpoint(reg, "endpoint-a")
+			// Flow control releases while saturation is below 1, so stop when the
+			// detector reports the share is full.
+			if detector.Saturation(ctx, []datalayer.Endpoint{endpoint}) >= 1 {
+				break
+			}
+			admitted[i]++
+			own := admitted[i]
+			reader.set("endpoint-a", own, 0)
+			require.GreaterOrEqual(t, int64(share), own, "this replica must never exceed its share")
+		}
+	}
+
+	require.Equal(t, int64(share), admitted[0], "each replica fills exactly its share")
+	require.Equal(t, int64(share), admitted[1])
+	require.Equal(t, int64(global), admitted[0]+admitted[1],
+		"the two replicas together are capped at the deployment-wide budget")
 }
 
-// TestBudget_OnPeerLoss_LocalLoadDivides verifies that against load which
-// excludes peers the mode divides unconditionally: there are no peer values to
-// lose, so the deployment total depends on the division.
-func TestBudget_OnPeerLoss_LocalLoadDivides(t *testing.T) {
+// TestBudget_SurvivorWidensAfterPeerLivenessExpires verifies a peer leaving the
+// live count widens the survivor's share, and the peer returning narrows it.
+func TestBudget_SurvivorWidensAfterPeerLivenessExpires(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(2, false)
-	detector := newBudgetDetector(t, "budget-peer-local", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadLocal)
+	source := (&fakeReplicaCounter{}).report(2)
+	detector := newBudgetDetector(t, "budget-leaves", dynamicTestConfig(true, 1.0, 0), source)
 
 	requests, tokens := detector.limits()
+	require.Equal(t, int64(32), requests, "two live replicas halve the request budget")
+	require.Equal(t, int64(176000), tokens, "two live replicas halve the token budget")
+
+	// The peer's liveness expires and the syncer drops it from the count.
+	source.report(1)
+	requests, tokens = detector.limits()
+	require.Equal(t, int64(64), requests, "the survivor takes over the departed peer's share")
+	require.Equal(t, int64(352000), tokens)
+
+	// The peer returns and is counted again.
+	source.report(2)
+	requests, tokens = detector.limits()
 	require.Equal(t, int64(32), requests)
 	require.Equal(t, int64(176000), tokens)
-	require.Equal(t, 1.0, promtestutil.ToFloat64(budgetDivided.WithLabelValues("budget-peer-local")))
 }
 
-// TestBudget_OnPeerLoss_UnknownScopeStaysDivided verifies the conservative
-// default before the in-flight producer is on the handle.
-func TestBudget_OnPeerLoss_UnknownScopeStaysDivided(t *testing.T) {
+// TestBudget_UnreachableStoreKeepsLastCount verifies an unreachable store leaves
+// the share at the last known count: it neither widens to the full budget nor
+// drops to zero.
+func TestBudget_UnreachableStoreKeepsLastCount(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(2, true)
-	detector := newBudgetDetector(t, "budget-peer-unknown", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadUnknown)
-
-	requests, _ := detector.limits()
-	require.Equal(t, int64(32), requests, "a partially wired detector keeps the conservative share")
-}
-
-// TestBudget_UnreachableStoreKeepsLastBudget verifies the count survives a
-// source that reports none, so the share does not widen to the global limit.
-func TestBudget_UnreachableStoreKeepsLastBudget(t *testing.T) {
-	t.Parallel()
-
-	source := (&fakeBudgetSource{}).report(2, false)
-	detector := newBudgetDetector(t, "budget-unreachable", dynamicTestConfig(budgetAlways, 1.0, 0), source, peerLoadLocal)
+	source := (&fakeReplicaCounter{}).report(2)
+	detector := newBudgetDetector(t, "budget-unreachable", dynamicTestConfig(true, 1.0, 0), source)
 
 	requests, tokens := detector.limits()
 	require.Equal(t, int64(32), requests)
@@ -257,36 +317,15 @@ func TestBudget_UnreachableStoreKeepsLastBudget(t *testing.T) {
 
 	source.loseCount()
 	requests, tokens = detector.limits()
-	require.Equal(t, int64(32), requests, "a lost count must not widen the budget")
+	require.Equal(t, int64(32), requests, "an unreachable store must not widen the budget to the full limit")
+	require.NotZero(t, requests)
 	require.Equal(t, int64(176000), tokens)
 
-	source.report(3, false)
+	// The store recovers and reports a larger fleet.
+	source.report(3)
 	requests, tokens = detector.limits()
 	require.Equal(t, int64(22), requests)
 	require.Equal(t, int64(117334), tokens)
-}
-
-// TestBudget_PeerLeavesAndJoins verifies the share follows the replica count.
-func TestBudget_PeerLeavesAndJoins(t *testing.T) {
-	t.Parallel()
-
-	source := (&fakeBudgetSource{}).report(2, false)
-	detector := newBudgetDetector(t, "budget-leaves", dynamicTestConfig(budgetAlways, 1.0, 0), source, peerLoadLocal)
-
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(32), requests, "two replicas halve the request budget")
-	require.Equal(t, int64(176000), tokens, "two replicas halve the token budget")
-
-	// The peer's heartbeat expires and the count drops.
-	source.report(1, false)
-	requests, tokens = detector.limits()
-	require.Equal(t, int64(64), requests, "the survivor takes over the departed peer's share")
-	require.Equal(t, int64(352000), tokens)
-
-	source.report(2, false)
-	requests, tokens = detector.limits()
-	require.Equal(t, int64(32), requests)
-	require.Equal(t, int64(176000), tokens)
 }
 
 // TestBudget_ColdStart verifies the limits before any replica count is known.
@@ -295,23 +334,23 @@ func TestBudget_ColdStart(t *testing.T) {
 
 	t.Run("expected replicas divide the budget", func(t *testing.T) {
 		t.Parallel()
-		source := &fakeBudgetSource{}
-		detector := newBudgetDetector(t, "budget-cold-start-expected", dynamicTestConfig(budgetOnPeerLoss, 1.0, 2), source, peerLoadSynced)
+		source := &fakeReplicaCounter{}
+		detector := newBudgetDetector(t, "budget-cold-start-expected", dynamicTestConfig(true, 1.0, 2), source)
 
 		requests, tokens := detector.limits()
 		require.Equal(t, int64(32), requests)
 		require.Equal(t, int64(176000), tokens)
 
-		source.report(3, true)
+		// The syncer reports the real count on its first publication.
+		source.report(4)
 		requests, tokens = detector.limits()
-		require.Equal(t, int64(64), requests, "fresh peer load restores the full limit")
-		require.Equal(t, int64(352000), tokens)
+		require.Equal(t, int64(16), requests)
+		require.Equal(t, int64(88000), tokens)
 	})
 
 	t.Run("no replica count keeps the global limit", func(t *testing.T) {
 		t.Parallel()
-		detector := newBudgetDetector(t, "budget-cold-start-unknown", dynamicTestConfig(budgetAlways, 1.0, 0),
-			&fakeBudgetSource{}, peerLoadLocal)
+		detector := newBudgetDetector(t, "budget-cold-start-unknown", dynamicTestConfig(true, 1.0, 0), &fakeReplicaCounter{})
 
 		requests, tokens := detector.limits()
 		require.Equal(t, int64(64), requests)
@@ -320,7 +359,7 @@ func TestBudget_ColdStart(t *testing.T) {
 
 	t.Run("no source keeps the global limit", func(t *testing.T) {
 		t.Parallel()
-		detector := newDetector("budget-cold-start-no-syncer", dynamicTestConfig(budgetAlways, 1.0, 0), logr.Discard())
+		detector := newDetector("budget-cold-start-no-syncer", dynamicTestConfig(true, 1.0, 0), logr.Discard())
 		require.NotNil(t, detector.budget)
 
 		requests, tokens := detector.limits()
@@ -333,31 +372,36 @@ func TestBudget_ColdStart(t *testing.T) {
 func TestBudget_Oversubscription(t *testing.T) {
 	t.Parallel()
 
-	detector := newBudgetDetector(t, "budget-oversubscription", dynamicTestConfig(budgetAlways, 1.1, 0),
-		(&fakeBudgetSource{}).report(3, false), peerLoadLocal)
+	detector := newBudgetDetector(t, "budget-oversubscription", dynamicTestConfig(true, 1.1, 0),
+		(&fakeReplicaCounter{}).report(3))
 
 	requests, tokens := detector.limits()
 	require.Equal(t, int64(24), requests, "ceil(64 / 3 * 1.1) = 24")
 	require.Equal(t, int64(129067), tokens, "ceil(352000 / 3 * 1.1) = 129067")
 }
 
-// TestBudget_OffKeepsGlobalLimits verifies that without division the detector
-// enforces exactly the configured limits.
-func TestBudget_OffKeepsGlobalLimits(t *testing.T) {
+// TestBudget_OffKeepsGlobalLimitsAndReadsTheAggregate verifies that with
+// dynamicBudget off the detector enforces the configured limits and reads the
+// load the attribute map holds, which may include peers.
+func TestBudget_OffKeepsGlobalLimitsAndReadsTheAggregate(t *testing.T) {
 	t.Parallel()
 
 	cfg := config{mode: modeRequests, maxConcurrency: 10, maxTokenConcurrency: 100}
 	detector := newDetector("budget-off", cfg, logr.Discard())
-	require.Nil(t, detector.budget, "the off mode never divides, so no budget is built")
+	require.Nil(t, detector.budget, "dynamicBudget is off, so no budget is built")
+
+	// A local reader is present but must not be used.
+	detector.withLocalLoad(newFakeLoadReader())
 
 	requests, tokens := detector.limits()
 	require.Equal(t, int64(10), requests)
 	require.Equal(t, int64(100), tokens)
 
-	// Saturation and filtering are those of a detector that never had a budget.
 	ctx := context.Background()
 	reg := newLocalRegistry()
-	driveLoad(ctx, reg, detector, "endpoint-a", 5)
+	// The attribute holds the aggregate, and with dynamicBudget off that is what
+	// the detector counts, so 5 of 10 is half full.
+	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 5 })
 	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
 	require.InDelta(t, 0.5, saturation, 1e-9)
 
@@ -365,76 +409,40 @@ func TestBudget_OffKeepsGlobalLimits(t *testing.T) {
 	require.Len(t, kept, 1)
 }
 
-// TestBudget_UnsafeAlwaysFallsBackToFullLimit verifies the runtime fallback for
-// `always` against load that already includes peers.
-func TestBudget_UnsafeAlwaysFallsBackToFullLimit(t *testing.T) {
+// TestBudget_OffUnaffectedByTinyShare is the counterpart to the peer-load case:
+// with dynamicBudget off, load from peers is deliberately counted against the
+// full limit.
+func TestBudget_OffCountsPeerLoadAgainstTheFullLimit(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(2, true)
-	detector := newBudgetDetector(t, "budget-unsafe-always", dynamicTestConfig(budgetAlways, 1.0, 0), source, peerLoadSynced)
-
-	// The resolver finds the producer syncing peers while a syncer is
-	// configured, which makes `always` invalid.
-	detector.resolveBudgetWith(t, true, true)
-
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(64), requests, "the unsafe mode falls back to the full limit")
-	require.Equal(t, int64(352000), tokens)
-	require.Equal(t, 0.0, promtestutil.ToFloat64(budgetDivided.WithLabelValues("budget-unsafe-always")))
-}
-
-// TestBudget_ResolveScope verifies the scope the resolver derives from the
-// in-flight producer's cross-replica configuration.
-func TestBudget_ResolveScope(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		mode        budgetMode
-		syncsPeers  bool
-		haveSyncer  bool
-		wantScope   peerLoadScope
-		wantDisable bool
-	}{
-		{name: "onPeerLoss with synced load requires freshness", mode: budgetOnPeerLoss, syncsPeers: true, haveSyncer: true, wantScope: peerLoadSynced},
-		{name: "onPeerLoss with local load divides unconditionally", mode: budgetOnPeerLoss, syncsPeers: false, haveSyncer: true, wantScope: peerLoadLocal},
-		{name: "always with local load divides", mode: budgetAlways, syncsPeers: false, haveSyncer: true, wantScope: peerLoadLocal},
-		{name: "always with synced load and no syncer divides", mode: budgetAlways, syncsPeers: true, haveSyncer: false, wantScope: peerLoadLocal},
-		{name: "always with synced load and a syncer is disabled", mode: budgetAlways, syncsPeers: true, haveSyncer: true, wantScope: peerLoadUnknown, wantDisable: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			detector := newBudgetDetector(t, "budget-resolve", dynamicTestConfig(tc.mode, 1.0, 0),
-				(&fakeBudgetSource{}).report(2, false), peerLoadUnknown)
-			detector.resolveBudgetWith(t, tc.syncsPeers, tc.haveSyncer)
-
-			require.Equal(t, tc.wantScope, peerLoadScope(detector.budget.scope.Load()))
-			require.Equal(t, tc.wantDisable, detector.budget.disabled.Load())
-
-			requests, _ := detector.limits()
-			if tc.wantDisable {
-				require.Equal(t, int64(64), requests)
-			} else {
-				require.Equal(t, int64(32), requests)
-			}
-		})
-	}
-}
-
-// TestBudget_AppliesToSaturationAndFilter verifies the effective limits drive
-// both the pool saturation signal and the per-endpoint filter.
-func TestBudget_AppliesToSaturationAndFilter(t *testing.T) {
-	t.Parallel()
-
-	detector := newBudgetDetector(t, "budget-applies", dynamicTestConfig(budgetAlways, 1.0, 0),
-		(&fakeBudgetSource{}).report(2, false), peerLoadLocal)
+	detector := newDetector("budget-off-aggregate", config{mode: modeRequests, maxConcurrency: 10}, logr.Discard())
+	reader := newFakeLoadReader()
+	reader.set("endpoint-a", 1, 1)
+	detector.withLocalLoad(reader)
 
 	ctx := context.Background()
 	reg := newLocalRegistry()
-	// 32 in-flight requests is full for a replica sharing a 64-request budget.
-	driveLoad(ctx, reg, detector, "endpoint-a", 32)
+	// This replica admits 1, but the aggregate is 4 + 4 = 8 of the 10 limit.
+	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 8 })
+
+	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
+	require.InDelta(t, 0.8, saturation, 1e-9, "dynamicBudget off keeps reading the aggregate")
+}
+
+// TestBudget_AppliesToSaturationAndFilter verifies the local load drives both
+// the saturation signal and the per-endpoint filter when dividing.
+func TestBudget_AppliesToSaturationAndFilter(t *testing.T) {
+	t.Parallel()
+
+	detector := newBudgetDetector(t, "budget-applies", dynamicTestConfig(true, 1.0, 0),
+		(&fakeReplicaCounter{}).report(2))
+	reader := newFakeLoadReader()
+	// 32 of this replica's own requests is full for a share of 32.
+	reader.set("endpoint-a", 32, 0)
+	detector.withLocalLoad(reader)
+
+	ctx := context.Background()
+	reg := newLocalRegistry()
 	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
 	require.InDelta(t, 1.0, saturation, 1e-9, "the per-replica share is the capacity, not the global limit")
 
@@ -446,79 +454,136 @@ func TestBudget_AppliesToSaturationAndFilter(t *testing.T) {
 	require.Equal(t, cleanEndpoint, kept[0].GetMetadata().ID.Name)
 }
 
-// TestBudget_TokenMode verifies the token limit is divided as well.
+// TestBudget_TokenMode verifies the token limit is divided and compared against
+// this replica's own tokens.
 func TestBudget_TokenMode(t *testing.T) {
 	t.Parallel()
 
-	cfg := dynamicTestConfig(budgetAlways, 1.0, 0)
+	cfg := dynamicTestConfig(true, 1.0, 0)
 	cfg.mode = modeTokens
-	detector := newBudgetDetector(t, "budget-tokens", cfg, (&fakeBudgetSource{}).report(2, false), peerLoadLocal)
+	detector := newBudgetDetector(t, "budget-tokens", cfg, (&fakeReplicaCounter{}).report(2))
+	reader := newFakeLoadReader()
+	reader.set("endpoint-a", 0, 88000)
+	detector.withLocalLoad(reader)
 
 	ctx := context.Background()
 	reg := newLocalRegistry()
-	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Tokens = 88000 })
 	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
 	require.InDelta(t, 0.5, saturation, 1e-9, "88000 of a 176000-token share")
+	require.Equal(t, 88000.0, promtestutil.ToFloat64(localTokenLoad.WithLabelValues("budget-tokens")))
 }
 
-// TestBudget_HandleSource verifies the count and freshness are read from the
-// cross-replica syncer on the plugin handle.
-func TestBudget_HandleSource(t *testing.T) {
+// TestBudget_NoLocalReaderFallsBackToAttribute verifies a producer that cannot
+// report local load leaves the detector on the attribute map rather than
+// reading nothing.
+func TestBudget_NoLocalReaderFallsBackToAttribute(t *testing.T) {
 	t.Parallel()
 
-	// Without a syncer on the handle neither is available.
-	source := &handleBudgetSource{handle: fwkplugin.NewEppHandle(t.Context(), nil)}
-	_, ok := source.ActiveReplicas()
-	require.False(t, ok)
-	require.False(t, source.peerLoadFresh())
+	detector := newBudgetDetector(t, "budget-no-local", dynamicTestConfig(true, 1.0, 0),
+		(&fakeReplicaCounter{}).report(2))
+	detector.localLoadMissing.Store(true)
 
-	// A syncer that counts replicas and reports freshness supplies both.
+	ctx := context.Background()
+	reg := newLocalRegistry()
+	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 16 })
+	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
+	require.InDelta(t, 0.5, saturation, 1e-9, "16 of the 32-request share, read from the attribute map")
+}
+
+// TestBudget_HandleResolvesLocalReader verifies the detector resolves the
+// in-flight producer by name on the handle and uses that producer's local load.
+func TestBudget_HandleResolvesLocalReader(t *testing.T) {
+	t.Parallel()
+
 	handle := fwkplugin.NewEppHandle(t.Context(), nil)
-	syncer := &fakeSyncer{source: (&fakeBudgetSource{}).report(4, true)}
-	handle.SetCrossReplicaSyncer(syncer)
+	reader := newFakeLoadReader()
+	reader.set("endpoint-a", 8, 0)
+	handle.AddPlugin("inflight-load-producer", &namedLoadProducer{name: "inflight-load-producer", reader: reader})
+	handle.SetCrossReplicaSyncer((&fakeReplicaCounter{}).report(2))
 
-	detector := newDetector("budget-handle-syncer", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), logr.Discard())
-	detector.budget.setSource(&handleBudgetSource{handle: handle})
-	detector.budget.setPeerLoadScope(peerLoadSynced)
+	detector := newDetector("budget-handle", dynamicTestConfig(true, 1.0, 0), logr.Discard())
+	detector.setHandle(handle)
+	detector.budget.setSource(&handleReplicaCounter{handle: handle})
 
-	requests, tokens := detector.limits()
-	require.Equal(t, int64(64), requests, "fresh peer load keeps the full limit")
-	require.Equal(t, int64(352000), tokens)
+	ctx := context.Background()
+	reg := newLocalRegistry()
+	// The attribute carries an aggregate that would look full on its own.
+	reg.update(fullEndpointName("endpoint-a"), func(load *attrconcurrency.InFlightLoad) { load.Requests = 32 })
 
-	syncer.source.stale()
-	requests, tokens = detector.limits()
-	require.Equal(t, int64(16), requests, "stale peer load divides by the syncer's count")
-	require.Equal(t, int64(88000), tokens)
+	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
+	require.InDelta(t, 8.0/32.0, saturation, 1e-9, "the resolved producer's local load, not the aggregate")
+}
+
+// TestBudget_HandleNamedProducer verifies the producer named in the config is
+// the one resolved.
+func TestBudget_HandleNamedProducer(t *testing.T) {
+	t.Parallel()
+
+	handle := fwkplugin.NewEppHandle(t.Context(), nil)
+	defaultReader := newFakeLoadReader()
+	defaultReader.set("endpoint-a", 32, 0)
+	namedReader := newFakeLoadReader()
+	namedReader.set("endpoint-a", 4, 0)
+	handle.AddPlugin("inflight-load-producer", &namedLoadProducer{name: "inflight-load-producer", reader: defaultReader})
+	handle.AddPlugin("admission-load", &namedLoadProducer{name: "admission-load", reader: namedReader})
+
+	cfg := dynamicTestConfig(true, 1.0, 0)
+	cfg.inFlightLoadProducerName = "admission-load"
+	detector := newDetector("budget-named", cfg, logr.Discard())
+	detector.setHandle(handle)
+	detector.budget.setSource((&fakeReplicaCounter{}).report(2))
+
+	ctx := context.Background()
+	reg := newLocalRegistry()
+	saturation := detector.Saturation(ctx, []datalayer.Endpoint{newFakeEndpoint(reg, "endpoint-a")})
+	require.InDelta(t, 4.0/32.0, saturation, 1e-9, "the named producer's local load")
 }
 
 // TestBudget_ConcurrentReads verifies concurrent evaluation is race-free and
-// always observes limits from a single decision.
+// always observes limits from a single count.
 func TestBudget_ConcurrentReads(t *testing.T) {
 	t.Parallel()
 
-	source := (&fakeBudgetSource{}).report(2, true)
-	detector := newBudgetDetector(t, "budget-concurrent", dynamicTestConfig(budgetOnPeerLoss, 1.0, 0), source, peerLoadSynced)
+	source := (&fakeReplicaCounter{}).report(2)
+	detector := newBudgetDetector(t, "budget-concurrent", dynamicTestConfig(true, 1.0, 0), source)
 
 	valid := map[[2]int64]bool{
-		{64, 352000}: true, // fresh peers: the full limit
-		{32, 176000}: true, // divided by two
-		{22, 117334}: true, // divided by three
+		{32, 176000}: true, // two live replicas
+		{22, 117334}: true, // three live replicas
+		{64, 352000}: true, // one live replica
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := range 50 {
-			source.report(2, i%2 == 0)
-			source.report(3, i%2 == 1)
+			if i%2 == 0 {
+				source.report(3)
+			} else {
+				source.report(1)
+			}
 		}
 	}()
 
 	for range 1000 {
 		requests, tokens := detector.limits()
 		require.True(t, valid[[2]int64{requests, tokens}],
-			"limits %d/%d came from mixed decisions", requests, tokens)
+			"limits %d/%d came from mixed counts", requests, tokens)
 	}
 	<-done
+}
+
+// TestBudget_Metrics verifies the gauges report the effective limits and the
+// replica count the limits were divided by.
+func TestBudget_Metrics(t *testing.T) {
+	t.Parallel()
+
+	const label = "budget-metrics"
+	detector := newBudgetDetector(t, label, dynamicTestConfig(true, 1.0, 0), (&fakeReplicaCounter{}).report(2))
+	detector.limits()
+
+	require.Equal(t, 32.0, promtestutil.ToFloat64(effectiveRequestBudget.WithLabelValues(label)))
+	require.Equal(t, 176000.0, promtestutil.ToFloat64(effectiveTokenBudget.WithLabelValues(label)))
+	require.Equal(t, 2.0, promtestutil.ToFloat64(budgetReplicas.WithLabelValues(label)))
 }
 
 // TestBudgetMetrics_Registration verifies the metrics register once per
@@ -532,197 +597,58 @@ func TestBudgetMetrics_Registration(t *testing.T) {
 	require.Error(t, registerBudgetMetrics(nil))
 }
 
-// TestBudgetConfig_Validation verifies the new parameters are defaulted and
+// TestBudgetConfig_Validation verifies the parameters are defaulted and
 // validated.
 func TestBudgetConfig_Validation(t *testing.T) {
 	t.Parallel()
 
 	defaults, err := buildConfig(&apiConfig{})
 	require.NoError(t, err)
-	require.Equal(t, budgetOff, defaults.budgetMode, "division is off by default")
-	require.False(t, defaults.dividesBudget())
+	require.False(t, defaults.dynamicBudget, "division is off by default")
 	require.Equal(t, 1.0, defaults.budgetOversubscription)
 	require.Zero(t, defaults.expectedReplicas)
 
 	for _, tc := range []struct {
 		name    string
-		params  string
+		cfg     apiConfig
 		wantErr string
 	}{
-		{name: "zero oversubscription", params: `{"budgetOversubscription": 0}`, wantErr: "budgetOversubscription must be strictly positive"},
-		{name: "negative oversubscription", params: `{"budgetOversubscription": -1}`, wantErr: "budgetOversubscription must be strictly positive"},
-		{name: "negative expected replicas", params: `{"expectedReplicas": -1}`, wantErr: "expectedReplicas must be non-negative"},
-		{name: "unknown mode", params: `{"dynamicBudget": "sometimes"}`, wantErr: "unsupported dynamicBudget"},
+		{name: "zero oversubscription", cfg: apiConfig{BudgetOversubscription: ptr.To(0.0)}, wantErr: "budgetOversubscription must be strictly positive"},
+		{name: "negative oversubscription", cfg: apiConfig{BudgetOversubscription: ptr.To(-1.0)}, wantErr: "budgetOversubscription must be strictly positive"},
+		{name: "negative expected replicas", cfg: apiConfig{ExpectedReplicas: ptr.To(-1)}, wantErr: "expectedReplicas must be non-negative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			var cfg apiConfig
-			require.NoError(t, json.Unmarshal([]byte(tc.params), &cfg))
-			_, err := buildConfig(&cfg)
+			_, err := buildConfig(&tc.cfg)
 			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
-}
 
-// TestBudgetConfig_Modes verifies the mode string, and the bool form kept for
-// compatibility.
-func TestBudgetConfig_Modes(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name string
-		json string
-		want budgetMode
-	}{
-		{name: "unset", json: `{}`, want: budgetOff},
-		{name: "off", json: `{"dynamicBudget": "off"}`, want: budgetOff},
-		{name: "always", json: `{"dynamicBudget": "always"}`, want: budgetAlways},
-		{name: "onPeerLoss", json: `{"dynamicBudget": "onPeerLoss"}`, want: budgetOnPeerLoss},
-		{name: "bool true is always", json: `{"dynamicBudget": true}`, want: budgetAlways},
-		{name: "bool false is off", json: `{"dynamicBudget": false}`, want: budgetOff},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			var cfg apiConfig
-			require.NoError(t, json.Unmarshal([]byte(tc.json), &cfg))
-			built, err := buildConfig(&cfg)
-			require.NoError(t, err)
-			require.Equal(t, tc.want, built.budgetMode)
-		})
-	}
-}
-
-// TestBudgetConfig_RejectsUnsafeAlwaysInFactory verifies the factory wiring and
-// that the mode reaches the budget.
-func TestBudgetConfig_RejectsUnsafeAlwaysInFactory(t *testing.T) {
-	t.Parallel()
-
-	handle := fwkplugin.NewEppHandle(t.Context(), nil)
-	plugin, err := ConcurrencyDetectorFactory("detector", fwkplugin.StrictDecoder([]byte(`{"dynamicBudget": "onPeerLoss"}`)), handle)
+	enabled, err := buildConfig(&apiConfig{DynamicBudget: ptr.To(true), BudgetOversubscription: ptr.To(1.1), ExpectedReplicas: ptr.To(2)})
 	require.NoError(t, err)
+	require.True(t, enabled.dynamicBudget)
+	require.Equal(t, 1.1, enabled.budgetOversubscription)
+	require.Equal(t, 2, enabled.expectedReplicas)
 
-	detector, ok := plugin.(*detector)
-	require.True(t, ok)
-	require.NotNil(t, detector.budget)
-	require.Equal(t, budgetOnPeerLoss, detector.budget.mode)
+	disabled, err := buildConfig(&apiConfig{DynamicBudget: ptr.To(false)})
+	require.NoError(t, err)
+	require.False(t, disabled.dynamicBudget)
 }
 
-// TestBudget_ResolveScopeFromHandle verifies the resolver reads the real
-// in-flight producer's cross-replica configuration from the handle, including
-// the auto-created default producer.
-func TestBudget_ResolveScopeFromHandle(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		mode        budgetMode
-		producer    *fakeInFlightProducer
-		syncer      bool
-		wantScope   peerLoadScope
-		wantDisable bool
-	}{
-		{
-			name: "onPeerLoss with the default synced producer", mode: budgetOnPeerLoss,
-			producer: &fakeInFlightProducer{}, syncer: true, wantScope: peerLoadSynced,
-		},
-		{
-			name: "onPeerLoss with a local producer", mode: budgetOnPeerLoss,
-			producer: &fakeInFlightProducer{syncDisabled: true}, syncer: true, wantScope: peerLoadLocal,
-		},
-		{
-			name: "always with a local producer", mode: budgetAlways,
-			producer: &fakeInFlightProducer{syncDisabled: true}, syncer: true, wantScope: peerLoadLocal,
-		},
-		{
-			name: "always with the default synced producer is disabled", mode: budgetAlways,
-			producer: &fakeInFlightProducer{}, syncer: true, wantScope: peerLoadUnknown, wantDisable: true,
-		},
-		{
-			name: "always with a synced producer and no syncer divides", mode: budgetAlways,
-			producer: &fakeInFlightProducer{}, syncer: false, wantScope: peerLoadLocal,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			handle := fwkplugin.NewEppHandle(t.Context(), nil)
-			// The default producer name is the plugin type, which is the name an
-			// unnamed instance gets.
-			handle.AddPlugin("inflight-load-producer", tc.producer)
-			if tc.syncer {
-				handle.SetCrossReplicaSyncer(&fakeSyncer{source: (&fakeBudgetSource{}).report(2, false)})
-			}
-
-			detector := newDetector("budget-from-handle", dynamicTestConfig(tc.mode, 1.0, 0), logr.Discard())
-			detector.setHandle(handle)
-			detector.budget.setSource(&handleBudgetSource{handle: handle})
-
-			// The first evaluation resolves the mode from the producer.
-			require.NotPanics(t, func() { detector.limits() })
-			require.Equal(t, tc.wantScope, peerLoadScope(detector.budget.scope.Load()))
-			require.Equal(t, tc.wantDisable, detector.budget.disabled.Load())
-		})
-	}
+// namedLoadProducer is a plugin named on the handle that reports local in-flight
+// load, standing in for the in-flight load producer.
+type namedLoadProducer struct {
+	name   string
+	reader *fakeLoadReader
 }
 
-// TestBudget_ResolveScopeFromHandleNamedProducer verifies a named in-flight
-// producer is the one inspected.
-func TestBudget_ResolveScopeFromHandleNamedProducer(t *testing.T) {
-	t.Parallel()
-
-	handle := fwkplugin.NewEppHandle(t.Context(), nil)
-	// The default producer syncs peers, but this detector reads a local one.
-	handle.AddPlugin("inflight-load-producer", &fakeInFlightProducer{})
-	handle.AddPlugin("admission-load", &fakeInFlightProducer{syncDisabled: true})
-	handle.SetCrossReplicaSyncer(&fakeSyncer{source: (&fakeBudgetSource{}).report(2, false)})
-
-	cfg := dynamicTestConfig(budgetOnPeerLoss, 1.0, 0)
-	cfg.inFlightLoadProducerName = "admission-load"
-	detector := newDetector("budget-named", cfg, logr.Discard())
-	detector.setHandle(handle)
-	detector.budget.setSource(&handleBudgetSource{handle: handle})
-
-	detector.limits()
-	require.Equal(t, peerLoadLocal, peerLoadScope(detector.budget.scope.Load()))
+func (p *namedLoadProducer) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{Type: "inflight-load-producer", Name: p.name}
 }
 
-// --- Test helpers ---
-
-// resolveBudgetWith runs the mode resolution against an in-flight producer with
-// the given cross-replica behaviour, instead of requiring a real one on the
-// handle.
-func (d *detector) resolveBudgetWith(t *testing.T, syncsPeers, haveSyncer bool) {
-	t.Helper()
-	d.budgetOnce.Do(func() {
-		d.applyBudgetResolution(syncsPeers, haveSyncer)
-	})
+func (p *namedLoadProducer) LocalInFlightLoad(endpointID string) (requests, tokens int64) {
+	return p.reader.LocalInFlightLoad(endpointID)
 }
 
-// fakeSyncer is a CrossReplicaSyncer that counts replicas and reports peer
-// freshness.
-type fakeSyncer struct {
-	source *fakeBudgetSource
-}
-
-func (s *fakeSyncer) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "fake-syncer", Name: "fake-syncer"}
-}
-
-func (s *fakeSyncer) ActiveReplicas() (int, bool) { return s.source.ActiveReplicas() }
-
-func (s *fakeSyncer) PeerLoadFresh() bool { return s.source.peerLoadFresh() }
-
-// fakeInFlightProducer is an in-flight load producer whose cross-replica
-// configuration the detector reads.
-type fakeInFlightProducer struct {
-	syncDisabled bool
-}
-
-func (p *fakeInFlightProducer) TypedName() fwkplugin.TypedName {
-	return fwkplugin.TypedName{Type: "inflight-load-producer", Name: "inflight-load-producer"}
-}
-
-func (p *fakeInFlightProducer) CrossReplicaState() fwkdl.CrossReplicaSpec {
-	return fwkdl.CrossReplicaSpec{SyncDisabled: p.syncDisabled}
-}
+var _ fwkdl.ReplicaCounter = (*fakeReplicaCounter)(nil)
+var _ datalayer.LocalInFlightLoadReader = (*namedLoadProducer)(nil)
