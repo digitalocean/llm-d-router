@@ -26,7 +26,7 @@ inflight-load-producer. Approximate prefix-cache state remains local.
 {{- if hasKey $redis "password" -}}
   {{- fail "router.epp.crossReplica.redis does not accept a plaintext password; use passwordSecretRef" -}}
 {{- end -}}
-{{- $parameters := dict "address" $redis.address "db" $redis.db "stateTTL" $redis.stateTTL "coordinationTTL" $redis.coordinationTTL -}}
+{{- $parameters := dict "address" $redis.address "db" $redis.db "stateTTL" $redis.stateTTL "coordinationTTL" $redis.coordinationTTL "warmStartTimeout" $redis.warmStartTimeout -}}
 {{- with $redis.inflightStateTTL -}}
   {{- $_ := set $parameters "inflightStateTTL" . -}}
 {{- end -}}

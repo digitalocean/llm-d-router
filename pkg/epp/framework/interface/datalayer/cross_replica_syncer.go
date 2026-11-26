@@ -129,6 +129,43 @@ type CrossReplicaContributor interface {
 	CrossReplicaState() CrossReplicaSpec
 }
 
+// CrossReplicaWarmStarter is an optional interface for a CrossReplicaSyncer
+// that can prime its peer aggregates from the store before the replica reports
+// ready. The runtime calls it once during startup, once per contributor spec,
+// with the endpoints registered at that moment.
+//
+// A warm start is best effort. Implementations bound the whole call by their
+// configured timeout, report what they merged, and return an error describing
+// why a partial or empty result happened; the runtime logs it and becomes ready
+// anyway, because a syncer that cannot reach its store must not keep the EPP
+// out of rotation.
+type CrossReplicaWarmStarter interface {
+	WarmStart(ctx context.Context, specs []CrossReplicaSpec, endpointIDs []string) WarmStartResult
+}
+
+// WarmStartResult reports what a warm start merged.
+type WarmStartResult struct {
+	// Endpoints is how many endpoints the syncer read peer state for.
+	Endpoints int
+	// Peers is how many peer values it merged into cached aggregates.
+	Peers int
+	// Err is why the warm start was incomplete, or nil when it read every
+	// endpoint it attempted.
+	Err error
+}
+
+// CrossReplicaWarmStartMerger is an optional interface for a
+// CrossReplicaContributor that can fold warm-started peer state into its local
+// view. The runtime calls it once the syncer has finished its warm start and
+// before the replica reports ready, so peer state reaches the contributor's own
+// index before the first request rather than on that request.
+type CrossReplicaWarmStartMerger interface {
+	// MergeWarmStart merges the peer state the syncer has already cached. It runs
+	// before any request, so it must not block on traffic and must tolerate
+	// endpoints that are not yet registered.
+	MergeWarmStart(ctx context.Context)
+}
+
 // CrossReplicaSpec declares what a CrossReplicaContributor publishes and where.
 type CrossReplicaSpec struct {
 	// StateKey namespaces this contributor's data in the syncer.

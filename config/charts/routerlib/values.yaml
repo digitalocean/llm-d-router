@@ -24,14 +24,17 @@ epp:
       # Expiration for every kind of synced state. Deployments on a slow publish
       # cycle raise it, so in-flight load survives until the next refresh.
       stateTTL: 2s
-      # Per-kind TTL overrides. Empty keeps the kind on stateTTL, so leaving both
-      # empty expires every kind of state on stateTTL as before the TTLs were
-      # split. Set prefixStateTTL above stateTTL to keep prefix windows in Redis
-      # after a replica's accounting values expire, so a restarted replica can
-      # restore them.
+      # Per-kind TTL overrides. An empty value keeps that kind on stateTTL, so
+      # clearing both restores the pre-split behavior of one TTL for everything.
+      # inflightStateTTL stays empty by default: in-flight load should expire as
+      # fast as stateTTL. prefixStateTTL is longer than stateTTL so a restarted
+      # replica can restore prefix windows from Redis.
       inflightStateTTL: ""
-      prefixStateTTL: ""
+      prefixStateTTL: 10m
       coordinationTTL: 180s
+      # How long a starting replica reads peer prefix state from Redis before it
+      # reports ready. An unreachable Redis delays readiness by at most this long.
+      warmStartTimeout: 30s
       # Existing Secret in the release namespace, exposed through passwordEnv.
       # passwordSecretRef:
       #   name: redis-auth

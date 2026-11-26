@@ -194,7 +194,11 @@ func TestStreamUnchangedWindowRefreshesTTLWithoutAppending(t *testing.T) {
 	a.publish(t)
 	require.Zero(t, a.log.count("xadd"))
 	require.Zero(t, a.log.count("xtrim"))
-	require.Zero(t, a.log.count("hset"), "an unchanged marker is not rewritten")
+	// The marker is unchanged, so only the per-tick liveness field is rewritten.
+	require.Equal(t, 1, a.log.count("hset"))
+	marker, err := a.syncer.client.HGet(context.Background(), a.hashKey(), markerField(a.syncer.replicaID)).Result()
+	require.NoError(t, err)
+	require.Equal(t, formatMarker(a.cursor(t)), marker)
 	require.Equal(t, testStateTTL, server.TTL(a.streamKey()))
 	require.Equal(t, testStateTTL, server.TTL(a.hashKey()))
 }
@@ -441,7 +445,9 @@ func TestStreamSpentBudgetStillRefreshesTTL(t *testing.T) {
 	server.FastForward(testStateTTL / 2)
 	a.publish(t)
 	require.Zero(t, a.log.count("xadd"))
-	require.Equal(t, 1, a.log.count("hpexpire", "hexpire"))
+	// The marker field and the liveness field each get a TTL, and the stream and
+	// hash get one pexpire each.
+	require.Equal(t, 2, a.log.count("hpexpire", "hexpire"))
 	require.Equal(t, 2, a.log.count("pexpire"))
 	require.Equal(t, testStateTTL, server.TTL(a.streamKey()))
 }
@@ -556,19 +562,26 @@ func TestStreamSkipsOversizedPrompt(t *testing.T) {
 	require.Equal(t, uint64(3), a.cursor(t).tip)
 }
 
-func TestStreamDeleteRemovesStreamAndMarker(t *testing.T) {
+func TestStreamDeleteRetainsWindowAndDropsLiveness(t *testing.T) {
 	server := miniredis.RunT(t)
 	a := newStreamReplica(t, server, "epp-a", true)
 	a.append([]uint64{1})
 	a.publish(t)
 
 	require.NoError(t, a.syncer.Delete(context.Background(), streamStateKey, testEndpointID))
-	require.False(t, server.Exists(a.streamKey()))
-	exists, err := a.syncer.client.HExists(context.Background(), a.hashKey(), markerField("epp-a")).Result()
+
+	// The window and its marker stay so a restarted replica can restore it, and
+	// only the replica's own liveness goes.
+	require.True(t, server.Exists(a.streamKey()), "a departed replica's stream is retained on the prefix TTL")
+	ctx := context.Background()
+	exists, err := a.syncer.client.HExists(ctx, a.hashKey(), refreshField("epp-a")).Result()
 	require.NoError(t, err)
-	require.False(t, exists)
+	require.False(t, exists, "the departed replica stops counting as live")
+	exists, err = a.syncer.client.HExists(ctx, a.hashKey(), markerField("epp-a")).Result()
+	require.NoError(t, err)
+	require.True(t, exists, "the marker is retained so the window can be restored")
 	_, ok := a.syncer.loadCursor(a.hashKey())
-	require.False(t, ok)
+	require.False(t, ok, "this replica's publish cursor is dropped")
 }
 
 func TestFullReplicationCommandsAreUnchanged(t *testing.T) {
@@ -597,6 +610,11 @@ func TestFullReplicationCommandsAreUnchanged(t *testing.T) {
 			names := make([]string, 0, len(recorder.commands))
 			for _, cmd := range recorder.commands {
 				names = append(names, cmd.Name())
+			}
+			if tc.name == "window in full mode" {
+				require.Equal(t, []string{"multi", "hset", "hpexpire", "pexpire", "hset", "hpexpire", "hgetall", "exec"}, names,
+					"a window adds the retained-window liveness field")
+				return
 			}
 			require.Equal(t, []string{"multi", "hset", "hpexpire", "pexpire", "hgetall", "exec"}, names)
 		})

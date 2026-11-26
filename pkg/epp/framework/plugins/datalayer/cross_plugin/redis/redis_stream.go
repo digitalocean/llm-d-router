@@ -99,6 +99,10 @@ type streamPeer struct {
 	value fwkdl.SequencedValue
 	// stale makes the next read start again from the peer's base.
 	stale bool
+	// active reports whether the peer's liveness field was present in its hash
+	// on this read. A retained window from a departed replica stays readable but
+	// stops counting as an active peer.
+	active bool
 }
 
 type streamPublication struct {
@@ -162,6 +166,10 @@ func (s *RedisSyncer) queueStream(ctx context.Context, pipe goredis.Pipeliner, k
 			pipe.HPExpire(ctx, hashKey, ttl, field),
 			pipe.PExpire(ctx, skey, ttl),
 			pipe.PExpire(ctx, hashKey, ttl))
+		// The prefix TTL keeps this window readable after this replica departs,
+		// so a liveness field on the in-flight TTL is what tells readers the
+		// replica is still here.
+		cmds = append(cmds, refreshCommands(ctx, pipe, hashKey, s.replicaID, s.inflightTTL())...)
 		pub.xlen = pipe.XLen(ctx, skey)
 		cmds = append(cmds, pub.xlen)
 	}
@@ -324,6 +332,7 @@ type peerFetch struct {
 	old      *streamPeer
 	prev     fwkdl.SequencedValue
 	reserved int
+	active   bool
 	cmd      *goredis.XMessageSliceCmd
 }
 
@@ -332,9 +341,12 @@ type streamRead struct {
 	legacy []any
 	// legacyIDs names the replicas of the whole-value peers in legacy.
 	legacyIDs []string
-	next      map[string]*streamPeer
-	fetches   []*peerFetch
-	changed   bool
+	// activeLegacyIDs names the replicas among legacyIDs whose liveness field
+	// is present.
+	activeLegacyIDs []string
+	next            map[string]*streamPeer
+	fetches         []*peerFetch
+	changed         bool
 }
 
 // readStreams rebuilds the peer aggregate for each publication from the
@@ -367,6 +379,8 @@ func (s *RedisSyncer) readStreams(ctx context.Context, key fwkdl.StateKey, aggre
 func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key fwkdl.StateKey, pub *publication) *streamRead {
 	logger := ctrl.LoggerFrom(ctx)
 	proto := pub.value.(fwkdl.SequencedValue)
+	raw := pub.result.Val()
+	live := newLiveSet(raw)
 	read := &streamRead{pub: pub, next: map[string]*streamPeer{}}
 	var cached map[string]*streamPeer
 	prevLegacy := 0
@@ -375,7 +389,6 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 		cached = entry.streams
 		prevLegacy = entry.legacyPeers
 	}
-	raw := pub.result.Val()
 	markers := map[string]streamMarker{}
 	for _, field := range slices.Sorted(maps.Keys(raw)) {
 		if field == s.replicaID || field == markerField(s.replicaID) {
@@ -392,6 +405,9 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 			}
 			read.legacy = append(read.legacy, value)
 			read.legacyIDs = append(read.legacyIDs, field)
+			if live.isLive(field) {
+				read.activeLegacyIDs = append(read.activeLegacyIDs, field)
+			}
 			continue
 		}
 		m, err := parseMarker(raw[field])
@@ -419,6 +435,7 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 
 	for _, id := range slices.Sorted(maps.Keys(markers)) {
 		m := markers[id]
+		active := live.isLive(id)
 		old := cached[id]
 		from, prev := m.base, fwkdl.SequencedValue(nil)
 		if old != nil && old.epoch == m.epoch && !old.stale {
@@ -428,19 +445,19 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 			switch {
 			case prev == nil:
 				empty, _ := proto.NewSequence(m.base, nil)
-				read.next[id] = &streamPeer{epoch: m.epoch, tip: m.base, value: empty}
+				read.next[id] = &streamPeer{epoch: m.epoch, tip: m.base, value: empty, active: active}
 				read.changed = true
 			case m.base > prev.SequenceBase():
 				advanced, _ := prev.Advance(m.base, nil)
-				read.next[id] = &streamPeer{epoch: m.epoch, tip: from, value: advanced}
+				read.next[id] = &streamPeer{epoch: m.epoch, tip: from, value: advanced, active: active}
 				read.changed = true
 			default:
-				read.next[id] = old
+				read.next[id] = withActive(old, active)
 			}
 			continue
 		}
 		if old != nil {
-			read.next[id] = old
+			read.next[id] = withActive(old, active)
 		}
 		count, reserved, ok := s.reserveRead(m, from)
 		if !ok {
@@ -448,11 +465,22 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 			continue
 		}
 		read.fetches = append(read.fetches, &peerFetch{
-			id: id, marker: m, from: from, old: old, prev: prev, reserved: reserved,
+			id: id, marker: m, from: from, old: old, prev: prev, reserved: reserved, active: active,
 			cmd: pipe.XRangeN(ctx, s.streamKey(pub.hashKey, id), streamID(from), streamID(m.tip-1), count),
 		})
 	}
 	return read
+}
+
+// withActive returns a copy of p with the peer's activity on this read, leaving
+// the cached peer untouched.
+func withActive(p *streamPeer, active bool) *streamPeer {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.active = active
+	return &cp
 }
 
 // reserveRead returns how many elements to request from a peer starting at
@@ -500,13 +528,14 @@ func (s *RedisSyncer) applyFetch(ctx context.Context, key fwkdl.StateKey, read *
 		if fetch.old != nil {
 			stale := *fetch.old
 			stale.stale = true
+			stale.active = fetch.active
 			read.next[fetch.id] = &stale
 		}
 		return false
 	}
 	tip := first + uint64(len(elems))
 	streamPeerLag.WithLabelValues(string(key)).Observe(float64(fetch.marker.tip - tip))
-	read.next[fetch.id] = &streamPeer{epoch: fetch.marker.epoch, tip: tip, value: value}
+	read.next[fetch.id] = &streamPeer{epoch: fetch.marker.epoch, tip: tip, value: value, active: fetch.active}
 	return true
 }
 
@@ -574,10 +603,18 @@ func (s *RedisSyncer) storeStreamAggregate(key fwkdl.StateKey, read *streamRead,
 	}
 	for _, id := range slices.Sorted(maps.Keys(read.next)) {
 		entry.peerIDs = append(entry.peerIDs, id)
-		if peer := read.next[id]; peer != nil && peer.value != nil {
+		peer := read.next[id]
+		if peer == nil {
+			continue
+		}
+		if peer.active {
+			entry.activePeerIDs = append(entry.activePeerIDs, id)
+		}
+		if peer.value != nil {
 			entry.peerEntries += int(peer.value.SequenceTip() - peer.value.SequenceBase())
 		}
 	}
+	entry.activePeerIDs = append(entry.activePeerIDs, read.activeLegacyIDs...)
 	entry.peerIDs = append(entry.peerIDs, read.legacyIDs...)
 	s.storeAggregate(key, hashKey, entry)
 	return peers

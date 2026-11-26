@@ -514,6 +514,13 @@ contributors emits one series set per key.
 | `llm_d_epp_redis_syncer_stream_budget_bytes_per_second` | Gauge | `direction` | Effective per-replica stream budget. Publish and read budgets are separate. |
 | `llm_d_epp_redis_syncer_stream_resets_total` | Counter | `state_key` | Streams the writer restarted under a new epoch. |
 | `llm_d_epp_redis_syncer_stream_peer_lag_generations` | Histogram | `state_key` | Generations a peer read was behind the peer's tip. |
+| `llm_d_epp_redis_syncer_warm_start_total` | Counter | `outcome` | Warm starts attempted, by outcome: `completed` read every endpoint, while `timeout` and `aborted` left part of the peer state unread. |
+| `llm_d_epp_redis_syncer_warm_start_duration_seconds` | Histogram | `outcome` | Time one warm start took. |
+| `llm_d_epp_redis_syncer_warm_start_peers` | Gauge | - | Peer values the last warm start merged. |
+
+`active_peers` counts live peers only. A departed replica's prefix window is retained in Valkey on
+`prefixStateTTL` so it can be restored, but its liveness field expires on `inflightStateTTL`, so it
+stops counting as a peer while its prompts stay merged.
 
 `valkey_up` reports reachability from the syncer's own traffic: a command that fails with a
 transport error sets it to `0`, and any command that reaches the server, including one the server
