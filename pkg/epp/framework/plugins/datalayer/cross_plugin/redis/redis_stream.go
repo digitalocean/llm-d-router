@@ -157,10 +157,11 @@ func (s *RedisSyncer) queueStream(ctx context.Context, pipe goredis.Pipeliner, k
 	pub := &streamPublication{prev: cur}
 	var cmds []goredis.Cmder
 	ttls := func() {
+		ttl := s.prefixTTL()
 		cmds = append(cmds,
-			pipe.HPExpire(ctx, hashKey, s.stateTTL, field),
-			pipe.PExpire(ctx, skey, s.stateTTL),
-			pipe.PExpire(ctx, hashKey, s.stateTTL))
+			pipe.HPExpire(ctx, hashKey, ttl, field),
+			pipe.PExpire(ctx, skey, ttl),
+			pipe.PExpire(ctx, hashKey, ttl))
 		pub.xlen = pipe.XLen(ctx, skey)
 		cmds = append(cmds, pub.xlen)
 	}
@@ -599,11 +600,12 @@ func (s *RedisSyncer) ensureMarker(ctx context.Context, pub *publication) {
 	}
 	hashKey := pub.hashKey
 	skey := s.streamKey(hashKey, s.replicaID)
+	ttl := s.prefixTTL()
 	pipe := s.client.Pipeline()
 	pipe.HSet(ctx, hashKey, field, formatMarker(cur))
-	pipe.HPExpire(ctx, hashKey, s.stateTTL, field)
-	pipe.PExpire(ctx, skey, s.stateTTL)
-	pipe.PExpire(ctx, hashKey, s.stateTTL)
+	pipe.HPExpire(ctx, hashKey, ttl, field)
+	pipe.PExpire(ctx, skey, ttl)
+	pipe.PExpire(ctx, hashKey, ttl)
 	if _, err := pipe.Exec(ctx); err != nil {
 		if v := ctrl.LoggerFrom(ctx).V(logutil.DEBUG); v.Enabled() {
 			v.Info("redis-syncer: restore stream marker failed", "key", hashKey, "error", err)

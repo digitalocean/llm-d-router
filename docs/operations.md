@@ -89,7 +89,8 @@ reserve capacity across different requests.
 During a Redis outage, EPP can start, and it keeps scheduling with the last peer
 state it read, plus its own live load, until Redis is reachable again. An EPP
 that has not read peer state yet uses local load only. Request-level
-coordination calls return Redis errors. Set `stateTTL` above the observed interval between
+coordination calls return Redis errors. Set `inflightStateTTL` (which falls back
+to `stateTTL` when it is unset) above the observed interval between
 successful endpoint refreshes, including latency variation; see the
 [Redis syncer README](../pkg/epp/framework/plugins/datalayer/cross_plugin/redis/README.md)
 for transport restrictions and publisher timing.
@@ -147,9 +148,9 @@ Operational takeaways:
 - Steady peer windows are cheap on the request path when the attribute is
   unchanged; cost spikes when the window slides (novel peer prompts). Prefer
   sizing `maxSyncedTokens` for publish payload and hit-rate, not for steady CPU.
-- Publish latency is on the sync interval, not in `Produce`. Keep `stateTTL`
-  above the refresh interval plus observed publish RTT (include Redis/Valkey
-  network time in cluster measurements).
+- Publish latency is on the sync interval, not in `Produce`. Keep
+  `inflightStateTTL` above the refresh interval plus observed publish RTT
+  (include Redis/Valkey network time in cluster measurements).
 - Redis/Valkey must support hash-field TTL (`HPEXPIRE`: Redis 7.4+ or Valkey 9+).
 
 ### Performance Reference Data
