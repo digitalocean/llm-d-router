@@ -101,19 +101,28 @@ func (s *RedisSyncer) observeReplicas(hashKey string, raw map[string]string) {
 //
 // This replica counts itself unconditionally. It is live by definition, and if
 // its own liveness field were missed the count would come up one short and the
-// budget would divide by too few.
+// budget would divide by too few. A peer with a draining marker does not count.
 func (s *RedisSyncer) liveReplicas(raw map[string]string) int {
 	live := newLiveSet(raw)
 	ids := make(map[string]struct{}, len(raw)+1)
 	ids[s.replicaID] = struct{}{}
+	draining := map[string]struct{}{}
 	for field := range raw {
+		if id, ok := strings.CutPrefix(field, drainingPrefix); ok && id != s.replicaID {
+			draining[id] = struct{}{}
+		}
+	}
+	for field := range raw {
+		if strings.HasPrefix(field, drainingPrefix) {
+			continue
+		}
 		if id, ok := strings.CutPrefix(field, markerPrefix); ok {
 			field = id
 		}
 		if id, ok := strings.CutPrefix(field, refreshPrefix); ok {
 			field = id
 		}
-		if live.isLive(field) {
+		if _, out := draining[field]; !out && live.isLive(field) {
 			ids[field] = struct{}{}
 		}
 	}

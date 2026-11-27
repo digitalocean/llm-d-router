@@ -346,7 +346,21 @@ func (r *Runner) runWithGracefulShutdown(ctx context.Context, mgr ctrl.Manager, 
 	if leaderElection {
 		elected = r.isLeader
 	}
+	context.AfterFunc(ctx, r.drainPlugins)
 	return serveWithDrain(ctx, mgr.Start, extProc, health, r.draining, elected, drainTimeout)
+}
+
+// drainPlugins tells every plugin that implements fwkdl.Drainer that this
+// replica stopped taking new requests.
+func (r *Runner) drainPlugins() {
+	if r.PluginHandle == nil {
+		return
+	}
+	for _, p := range r.PluginHandle.GetAllPlugins() {
+		if d, ok := p.(fwkdl.Drainer); ok {
+			d.StartDrain()
+		}
+	}
 }
 
 func (r *Runner) stopServing() {

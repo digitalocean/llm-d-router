@@ -34,6 +34,13 @@ type ReplicaCounter interface {
 	ActiveReplicas() (count int, ok bool)
 }
 
+// Drainer is an optional interface for a plugin that changes behavior once the
+// replica starts draining on SIGTERM. The replica keeps serving its in-flight
+// requests but takes no new ones, so a syncer stops reporting it as live.
+type Drainer interface {
+	StartDrain()
+}
+
 // LocalInFlightLoadReader is an optional interface for a plugin that reports
 // this replica's own in-flight load for one endpoint, excluding anything other
 // replicas published.

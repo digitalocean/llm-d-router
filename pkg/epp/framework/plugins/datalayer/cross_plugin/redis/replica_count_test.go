@@ -405,3 +405,32 @@ func TestActiveReplicasStreamPath(t *testing.T) {
 	count, _ = reader.syncer.ActiveReplicas()
 	require.Equal(t, 2, count)
 }
+
+// TestActiveReplicasExcludesDrainingPeer verifies a draining peer leaves the
+// count at once while its in-flight load still reaches the aggregate.
+func TestActiveReplicasExcludesDrainingPeer(t *testing.T) {
+	t.Parallel()
+
+	server := miniredis.RunT(t)
+	syncer := newReplicaCountSyncer(t, server, testReplicaID)
+	peer := newReplicaCountSyncer(t, server, "epp-b")
+	ctx := context.Background()
+
+	require.NoError(t, peer.set(ctx, testStateKey, testEndpointID, 5, sumInts))
+	require.NoError(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
+	count, _ := syncer.ActiveReplicas()
+	require.Equal(t, 2, count)
+
+	peer.StartDrain()
+	require.NoError(t, peer.set(ctx, testStateKey, testEndpointID, 5, sumInts))
+	// The earlier two-replica observation holds for one in-flight TTL.
+	ageReplicaObservations(syncer, 2*syncer.inflightTTL())
+	require.NoError(t, syncer.set(ctx, testStateKey, testEndpointID, 1, sumInts))
+	total := syncer.get(ctx, testStateKey, testEndpointID, 1, sumInts)
+	require.Equal(t, 6, total, "a draining peer's in-flight load still counts")
+	count, _ = syncer.ActiveReplicas()
+	require.Equal(t, 1, count, "a draining peer no longer divides the budget")
+
+	drainingCount, _ := peer.ActiveReplicas()
+	require.Equal(t, 2, drainingCount, "the draining replica's own view is unchanged")
+}

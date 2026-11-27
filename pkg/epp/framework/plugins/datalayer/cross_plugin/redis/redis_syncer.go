@@ -90,6 +90,8 @@ type RedisSyncer struct {
 	typedName fwkplugin.TypedName
 	replicaID string
 	client    *goredis.Client
+	// draining stops liveness refreshes once shutdown starts. See StartDrain.
+	draining atomic.Bool
 	// stateTTL expires every kind of synced state. It is the only TTL unless
 	// inflightStateTTL or prefixStateTTL override it, which keeps a
 	// configuration that sets stateTTL alone behaving as before the split.
@@ -363,7 +365,9 @@ func (s *RedisSyncer) set(ctx context.Context, key fwkdl.StateKey, endpointID st
 		s.prefixKeys.Store(key, struct{}{})
 		// The liveness field outlives neither stateTTL nor inflightStateTTL; in
 		// this path it only has to survive until the next tick rewrites it.
-		refreshCommands(ctx, pipe, hashKey, s.replicaID, s.inflightTTL())
+		s.livenessCommands(ctx, pipe, hashKey)
+	} else {
+		s.drainCommands(ctx, pipe, hashKey)
 	}
 	result := pipe.HGetAll(ctx, hashKey)
 	if _, err := pipe.Exec(ctx); err != nil {
@@ -397,7 +401,7 @@ func (s *RedisSyncer) cachePeerAggregate(ctx context.Context, key fwkdl.StateKey
 	peerIDs := make([]string, 0, len(raw))
 	activePeerIDs := make([]string, 0, len(raw))
 	for _, field := range slices.Sorted(maps.Keys(raw)) {
-		if field == s.replicaID || strings.HasPrefix(field, refreshPrefix) || strings.HasPrefix(field, markerPrefix) {
+		if field == s.replicaID || strings.HasPrefix(field, refreshPrefix) || strings.HasPrefix(field, markerPrefix) || strings.HasPrefix(field, drainingPrefix) {
 			continue
 		}
 		encoded := raw[field]
@@ -542,7 +546,9 @@ func (s *RedisSyncer) publishChunk(ctx context.Context, key fwkdl.StateKey, aggr
 			}
 			if s.retainsPrefix(value) {
 				s.prefixKeys.Store(key, struct{}{})
-				pub.commands = append(pub.commands, refreshCommands(ctx, pipe, pub.hashKey, s.replicaID, s.inflightTTL())...)
+				pub.commands = append(pub.commands, s.livenessCommands(ctx, pipe, pub.hashKey)...)
+			} else {
+				pub.commands = append(pub.commands, s.drainCommands(ctx, pipe, pub.hashKey)...)
 			}
 		}
 		pub.result = pipe.HGetAll(ctx, pub.hashKey)
