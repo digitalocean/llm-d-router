@@ -79,6 +79,34 @@ type apiConfig struct {
 	MaxTokenConcurrency      *int64 `json:"maxTokenConcurrency,omitempty"`
 	InFlightLoadProducerName string `json:"inFlightLoadProducerName,omitempty"`
 
+	// DynamicBudget divides MaxConcurrency and MaxTokenConcurrency across the
+	// active EPP replicas. Each replica admits up to
+	// ceil(global / live_replicas * BudgetOversubscription) of ITS OWN in-flight
+	// load, so the shares add up to the deployment-wide limit.
+	//
+	// This bounds cluster-wide admission even during a burst, when replicas have
+	// not yet seen each other's admissions through the cross-replica syncer. The
+	// cost is early shedding when traffic is unevenly spread between replicas: a
+	// replica admits at most its share even while another sits idle.
+	//
+	// Defaults to false, which enforces the full limit on every replica
+	// measured against the load the detector reads, including peer load when the
+	// in-flight producer syncs across replicas.
+	DynamicBudget *bool `json:"dynamicBudget,omitempty"`
+
+	// BudgetOversubscription scales the per-replica share computed when
+	// DynamicBudget is set, to tolerate uneven load across replicas. 1.0 keeps
+	// the shares adding up to exactly the deployment-wide limit.
+	//
+	// Defaults to 1.0 if unset.
+	BudgetOversubscription *float64 `json:"budgetOversubscription,omitempty"`
+
+	// ExpectedReplicas is the replica count the limit is divided by before the
+	// cross-replica syncer reports one, such as during a cold start. With a
+	// syncer that reports no count and no expected count, the limit is not
+	// divided. Zero or unset leaves it unknown.
+	ExpectedReplicas *int `json:"expectedReplicas,omitempty"`
+
 	// FailOpen controls the scheduling filter when every candidate endpoint is over its limit.
 	//
 	// When true, the filter returns all candidates and the scorers pick the least loaded one.
@@ -112,6 +140,11 @@ const (
 	defaultMaxTokenConcurrency int64 = 1000000
 	// defaultFailOpen is used when FailOpen is unset.
 	defaultFailOpen = true
+	// defaultDynamicBudget keeps the full deployment-wide limit on every replica.
+	defaultDynamicBudget = false
+	// defaultBudgetOversubscription keeps the per-replica shares adding up to
+	// exactly the deployment-wide limit.
+	defaultBudgetOversubscription = 1.0
 )
 
 // config is the internal, fully-validated configuration used by the detector.
@@ -123,6 +156,12 @@ type config struct {
 	inFlightLoadProducerName string
 	// failClosed makes the filter return no endpoints when every candidate is over its limit.
 	failClosed bool
+	// dynamicBudget divides the limits across the live replicas.
+	dynamicBudget bool
+	// budgetOversubscription scales each replica's share of the limits.
+	budgetOversubscription float64
+	// expectedReplicas divides the limits before the replica count is known.
+	expectedReplicas int
 }
 
 // buildConfig applies the configuration lifecycle (defaulting and validation) and translates the
@@ -147,7 +186,19 @@ func buildConfig(apiCfg *apiConfig) (*config, error) {
 		maxTokenConcurrency:      *safeCfg.MaxTokenConcurrency,
 		inFlightLoadProducerName: safeCfg.InFlightLoadProducerName,
 		failClosed:               !*safeCfg.FailOpen,
+		dynamicBudget:            *safeCfg.DynamicBudget,
+		budgetOversubscription:   *safeCfg.BudgetOversubscription,
+		expectedReplicas:         coldStartReplicas(&safeCfg),
 	}, nil
+}
+
+// coldStartReplicas returns the configured cold-start replica count, or zero
+// when unset.
+func coldStartReplicas(cfg *apiConfig) int {
+	if cfg.ExpectedReplicas == nil {
+		return 0
+	}
+	return *cfg.ExpectedReplicas
 }
 
 // applyDefaults populates unset fields in the external configuration with their standard defaults.
@@ -166,6 +217,12 @@ func applyDefaults(cfg *apiConfig) {
 	}
 	if cfg.FailOpen == nil {
 		cfg.FailOpen = ptr.To(defaultFailOpen)
+	}
+	if cfg.DynamicBudget == nil {
+		cfg.DynamicBudget = ptr.To(defaultDynamicBudget)
+	}
+	if cfg.BudgetOversubscription == nil {
+		cfg.BudgetOversubscription = ptr.To(defaultBudgetOversubscription)
 	}
 }
 
@@ -191,6 +248,13 @@ func validateConfig(cfg *apiConfig) error {
 		default:
 			errs = append(errs, fmt.Errorf("unsupported concurrencyMode: %q", *cfg.ConcurrencyMode))
 		}
+	}
+
+	if cfg.BudgetOversubscription != nil && !(*cfg.BudgetOversubscription > 0.0) {
+		errs = append(errs, fmt.Errorf("budgetOversubscription must be strictly positive, got %f", *cfg.BudgetOversubscription))
+	}
+	if cfg.ExpectedReplicas != nil && *cfg.ExpectedReplicas < 0 {
+		errs = append(errs, fmt.Errorf("expectedReplicas must be non-negative, got %d", *cfg.ExpectedReplicas))
 	}
 
 	return errors.Join(errs...)

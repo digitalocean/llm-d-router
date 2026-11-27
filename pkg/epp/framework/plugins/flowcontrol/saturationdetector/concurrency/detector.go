@@ -37,6 +37,7 @@ import (
 	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrconcurrency "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/concurrency"
+	inflightloadconstants "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/requesthandling/dataproducer/inflightload/constants"
 )
 
 const (
@@ -59,7 +60,21 @@ func ConcurrencyDetectorFactory(
 	if err != nil {
 		return nil, err
 	}
-	return newDetector(name, *cfg, log.FromContext(handle.Context())), nil
+	detector := newDetector(name, *cfg, log.FromContext(handle.Context()))
+	detector.setHandle(handle)
+	if handle != nil && handle.Metrics() != nil {
+		if err := registerBudgetMetrics(handle.Metrics()); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.dynamicBudget && handle != nil {
+		// The cross-replica syncer is added to the handle after plugins are
+		// instantiated, so the replica count is resolved on first use.
+		detector.budget.setSource(&handleReplicaCounter{handle: handle})
+	} else {
+		recordStaticBudget(name, *cfg)
+	}
+	return detector, nil
 }
 
 var (
@@ -72,10 +87,28 @@ var (
 type detector struct {
 	config                       config
 	typedName                    fwkplugin.TypedName
+	logger                       logr.Logger
 	inFlightLoadDataKey          fwkplugin.DataKey
 	uncachedRequestTokensDataKey fwkplugin.DataKey
 	dispatchReservations         sync.Map
 	pendingDispatches            atomic.Int64
+	// budget decides the limits this replica enforces. Nil when dynamicBudget
+	// is off, so the configured limits apply unchanged.
+	budget *replicaBudget
+	// handle is read on the first evaluation to resolve the in-flight load
+	// producer whose own counters a divided budget is compared against.
+	handle fwkplugin.Handle
+	// inFlightProducerName is the name the detector resolves on the handle to
+	// reach that producer.
+	inFlightProducerName string
+	budgetOnce           sync.Once
+	// localLoad returns this replica's own in-flight load and whether the
+	// producer reports it. It is resolved from the handle on first evaluation
+	// and is nil-safe through localLoadFor.
+	localLoad atomic.Pointer[datalayer.LocalInFlightLoadReader]
+	// localLoadMissing is set once resolving showed no producer that reports
+	// local load, so the check is not repeated on every evaluation.
+	localLoadMissing atomic.Bool
 }
 
 // newDetector creates a new instance of the Concurrency Detector.
@@ -91,7 +124,8 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 		"maxConcurrency", cfg.maxConcurrency,
 		"maxTokenConcurrency", cfg.maxTokenConcurrency,
 		"headroom", cfg.headroom,
-		"failOpen", !cfg.failClosed)
+		"failOpen", !cfg.failClosed,
+		"dynamicBudget", cfg.dynamicBudget)
 
 	if cfg.headroom > 1.0 {
 		pluginLogger.Info("Unusually high headroom configured; verify value is a fraction, not a percentage",
@@ -99,12 +133,86 @@ func newDetector(name string, cfg config, logger logr.Logger) *detector {
 			"effectiveBurst", fmt.Sprintf("%.0f%%", cfg.headroom*100))
 	}
 
-	return &detector{
+	producerName := cfg.inFlightLoadProducerName
+	if producerName == "" {
+		// Unset selects the unnamed instance, which the loader names after its
+		// type, the same name the data key defaults to.
+		producerName = inflightloadconstants.InFlightLoadProducerType
+	}
+	d := &detector{
 		config:                       cfg,
 		typedName:                    typedName,
+		logger:                       pluginLogger,
 		inFlightLoadDataKey:          attrconcurrency.InFlightLoadDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
 		uncachedRequestTokensDataKey: attrconcurrency.UncachedRequestTokensDataKey.WithNonEmptyProducerName(cfg.inFlightLoadProducerName),
+		inFlightProducerName:         producerName,
 	}
+	if cfg.dynamicBudget {
+		d.budget = newReplicaBudget(cfg, name, pluginLogger)
+	}
+	return d
+}
+
+// setHandle supplies the plugin handle the budget resolves the syncer and the
+// in-flight producer from.
+func (d *detector) setHandle(handle fwkplugin.Handle) {
+	d.handle = handle
+}
+
+// budgetLabel is the value of the detector label on the budget gauges.
+func (d *detector) budgetLabel() string {
+	return d.typedName.Name
+}
+
+// limits returns the request and token limits this replica enforces.
+func (d *detector) limits() (requests, tokens int64) {
+	if d.budget == nil {
+		return d.config.maxConcurrency, d.config.maxTokenConcurrency
+	}
+	return d.budget.limits()
+}
+
+// resolveLocalLoad resolves, once, the in-flight load producer that reports
+// this replica's own load. With dynamicBudget on, the detector compares the
+// divided budget against that local load: the installed InFlightLoad attribute
+// is replaced with a cross-replica aggregate when sync is on, and counting peer
+// load against a per-replica share would block well below the share.
+//
+// The producer is looked up on the first evaluation because plugins are
+// instantiated before they are all on the handle. A producer that does not
+// report local load leaves the detector on the aggregate, which is what it
+// reads with dynamicBudget off, and says so once.
+func (d *detector) resolveLocalLoad() {
+	d.budgetOnce.Do(func() {
+		if d.handle == nil {
+			return
+		}
+		reader, ok := d.handle.Plugin(d.inFlightProducerName).(datalayer.LocalInFlightLoadReader)
+		if !ok {
+			d.localLoadMissing.Store(true)
+			d.logger.Info("The in-flight load producer does not report local load; the divided flow-control budget is measured "+
+				"against the load the detector reads, which may include peers",
+				"inFlightLoadProducer", d.inFlightProducerName)
+			return
+		}
+		d.localLoad.Store(&reader)
+	})
+}
+
+// localLoadFor returns this replica's own in-flight load for an endpoint. It
+// reports false when the producer does not expose local load, in which case the
+// caller falls back to the endpoint's attribute map.
+func (d *detector) localLoadFor(endpointID string) (requests, tokens int64, ok bool) {
+	d.resolveLocalLoad()
+	if d.localLoadMissing.Load() {
+		return 0, 0, false
+	}
+	reader := d.localLoad.Load()
+	if reader == nil {
+		return 0, 0, false
+	}
+	requests, tokens = (*reader).LocalInFlightLoad(endpointID)
+	return requests, tokens, true
 }
 
 // TypedName returns the type and name tuple of this plugin instance.
@@ -122,6 +230,33 @@ func (d *detector) Consumes() fwkplugin.DataDependencies {
 	return fwkplugin.DataDependencies{
 		Required: required,
 	}
+}
+
+// loadFor returns the in-flight load the detector counts for an endpoint.
+//
+// With dynamicBudget off this is the InFlightLoad attribute, which the
+// cross-replica publisher replaces with an aggregate across peers, so the full
+// deployment-wide limit is compared against a deployment-wide load. With it on,
+// this replica's own counters are used instead, because the limit is only this
+// replica's share of the deployment.
+func (d *detector) loadFor(endpointID string, attributes datalayer.AttributeMap) *attrconcurrency.InFlightLoad {
+	if d.budget != nil && endpointID != "" {
+		if requests, tokens, ok := d.localLoadFor(endpointID); ok {
+			return &attrconcurrency.InFlightLoad{Requests: requests, Tokens: tokens}
+		}
+	}
+	return d.getLoad(attributes)
+}
+
+// endpointLoad is loadFor for an endpoint, keyed by the endpoint's identity.
+// Both the datalayer and scheduling Endpoint interfaces expose metadata and the
+// attribute map, so one helper serves Saturation and Filter.
+func (d *detector) endpointLoad(meta *datalayer.EndpointMetadata, attributes datalayer.AttributeMap) *attrconcurrency.InFlightLoad {
+	id := ""
+	if meta != nil {
+		id = meta.GetNamespacedName().String()
+	}
+	return d.loadFor(id, attributes)
 }
 
 func (d *detector) getLoad(m datalayer.AttributeMap) *attrconcurrency.InFlightLoad {
@@ -183,11 +318,14 @@ func (d *detector) getIncomingTokens(m datalayer.AttributeMap) int64 {
 // The inflight counts are read from the InFlightLoad attribute, which the
 // InFlightLoadProducer increments at dispatch and decrements on request
 // completion, so the signal already reflects completions with no scrape lag.
+// With dynamicBudget on, the counts are this replica's own instead, so the
+// divided capacity is compared against the load that fills it.
 func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint) float64 {
 	if len(endpoints) == 0 {
 		return 1.0
 	}
 
+	maxRequests, maxTokens := d.limits()
 	var reqInflight, reqCapacity, tokInflight, tokCapacity int64
 	var endpointCount int
 	var hybridSatSum float64
@@ -197,22 +335,25 @@ func (d *detector) Saturation(_ context.Context, endpoints []datalayer.Endpoint)
 		}
 
 		endpointCount++
-		reqCapacity += d.config.maxConcurrency
-		tokCapacity += d.config.maxTokenConcurrency
+		reqCapacity += maxRequests
+		tokCapacity += maxTokens
 
 		if e.GetMetadata() == nil {
 			continue
 		}
 
-		load := d.getLoad(e.GetAttributes())
+		load := d.endpointLoad(e.GetMetadata(), e.GetAttributes())
 		reqInflight += load.Requests
 		tokInflight += load.Tokens
 		hybridSatSum += max(
-			ratio(load.Requests, d.config.maxConcurrency),
-			ratio(load.Tokens, d.config.maxTokenConcurrency),
+			ratio(load.Requests, maxRequests),
+			ratio(load.Tokens, maxTokens),
 		)
 	}
 	pendingDispatches := d.pendingDispatches.Load()
+	if d.budget != nil {
+		observeLocalLoad(d.budgetLabel(), reqInflight, tokInflight)
+	}
 
 	switch d.config.mode {
 	case modeTokens:
@@ -254,15 +395,16 @@ func (d *detector) Filter(
 	// Pre-allocate assuming most endpoints will pass the filter to minimize allocations.
 	filtered := make([]fwksched.Endpoint, 0, len(endpoints))
 
-	reqLimit := int64(float64(d.config.maxConcurrency) * (1.0 + d.config.headroom))
-	tokLimit := int64(float64(d.config.maxTokenConcurrency) * (1.0 + d.config.headroom))
+	reqMax, tokMax := d.limits()
+	reqLimit := int64(float64(reqMax) * (1.0 + d.config.headroom))
+	tokLimit := int64(float64(tokMax) * (1.0 + d.config.headroom))
 	countIncoming := d.config.mode == modeTokens || d.config.mode == modeHybrid
 
 	for _, e := range endpoints {
 		if e == nil {
 			continue
 		}
-		load := d.getLoad(e)
+		load := d.endpointLoad(e.GetMetadata(), e)
 		var incomingTokens int64
 		if countIncoming {
 			incomingTokens = d.getIncomingTokens(e)

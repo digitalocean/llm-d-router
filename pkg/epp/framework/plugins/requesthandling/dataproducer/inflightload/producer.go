@@ -130,6 +130,7 @@ var (
 	_ datalayer.EndpointExtractor       = (*InFlightLoadProducer)(nil)
 	_ datalayer.Registrant              = &InFlightLoadProducer{}
 	_ datalayer.CrossReplicaContributor = (*InFlightLoadProducer)(nil)
+	_ datalayer.LocalInFlightLoadReader = (*InFlightLoadProducer)(nil)
 	_ fwkplugin.ConsumerPlugin          = &InFlightLoadProducer{}
 	_ fwkplugin.StateDumper             = &InFlightLoadProducer{}
 )
@@ -776,6 +777,15 @@ func (p *InFlightLoadProducer) GetTokens(eid string) int64 {
 
 func (p *InFlightLoadProducer) GetRequests(eid string) int64 {
 	return p.requestTracker.get(eid)
+}
+
+// LocalInFlightLoad implements datalayer.LocalInFlightLoadReader. It reports
+// this replica's own counters, which are the values a limit divided across
+// replicas must be compared against: the installed InFlightLoad attribute is
+// replaced with an aggregate across peers when cross-replica sync is on, and
+// peer load must not count against a per-replica share.
+func (p *InFlightLoadProducer) LocalInFlightLoad(endpointID string) (requests, tokens int64) {
+	return p.requestTracker.get(endpointID), p.tokenTracker.get(endpointID)
 }
 
 // concurrencyTracker manages thread-safe counters for inflight requests.

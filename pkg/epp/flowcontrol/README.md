@@ -173,6 +173,37 @@ Fixed shares have these costs:
   positive integer, so the remainder of a limit that the replica count does not divide goes unused,
   and a limit lower than the replica count cannot be enforced.
 
+#### Dynamic budget
+
+Instead of dividing the limit by hand, set `dynamicBudget: true` on `concurrency-detector`. It keeps
+the deployment-wide `maxConcurrency` and `maxTokenConcurrency` in configuration and shares them across
+the live replicas at runtime:
+
+```
+effective = ceil(global_limit / live_replicas * budgetOversubscription)
+```
+
+Each replica admits that share **of its own in-flight load**. Global 10 over two live replicas is 5
+each; when one replica departs, the survivor's share becomes 10 on the next liveness expiry, and when
+it returns both drop back to 5. `redis-syncer` supplies the count from the `refresh:<replica field>`
+liveness field, which expires on `inflightStateTTL`, so a retained prefix window does not keep a
+departed replica in the divisor. `expectedReplicas` divides the limit before the first count is known,
+and an unreachable store keeps the last share.
+
+This is the recommended configuration for production HA. It bounds cluster-wide admission even during
+a burst: synced peer load arrives late, so with the full limit on every replica each can admit the
+whole budget before seeing the others, and the deployment can reach N times it. A per-replica share
+measured against local load cannot. The price is early shedding when traffic is unevenly spread — a
+replica caps at its share while another sits idle — which `budgetOversubscription` can partly offset.
+
+The detector reads the in-flight load producer's own counters through
+`LocalInFlightLoadReader.LocalInFlightLoad` rather than the endpoint's `InFlightLoad` attribute, which
+the cross-replica publisher replaces with the aggregate across peers. Leave
+`syncCrossReplicaState` at its default (`true`): the aggregate still feeds the routing scorers, which
+are unchanged, while the divided budget is measured against local load. See the
+[concurrency detector](../framework/plugins/flowcontrol/saturationdetector/concurrency/README.md#dynamic-budget)
+for the details and the budget metrics.
+
 ### High Level Architecture
 
 The following diagram illustrates the high-level dependency model and request flow for the system. It shows how

@@ -72,6 +72,38 @@ func (l liveSet) isLive(replicaID string) bool {
 	return ok
 }
 
+// drainingPrefix names the hash field a replica writes once it is draining. A
+// draining replica still publishes its in-flight load so peers see it finish,
+// but it takes no new requests, so peers must stop dividing a budget by it.
+// The liveness field alone cannot say that: in-flight hashes carry none, and
+// a replica's value field there is what makes it count.
+const drainingPrefix = "draining:"
+
+// livenessCommands queues this replica's liveness refresh, or the draining
+// marker in its place once the replica is draining.
+func (s *RedisSyncer) livenessCommands(ctx context.Context, pipe goredis.Pipeliner, hashKey string) []goredis.Cmder {
+	if s.draining.Load() {
+		return s.drainCommands(ctx, pipe, hashKey)
+	}
+	return refreshCommands(ctx, pipe, hashKey, s.replicaID, s.inflightTTL())
+}
+
+// drainCommands writes and expires the draining marker, or nothing while the
+// replica is not draining.
+func (s *RedisSyncer) drainCommands(ctx context.Context, pipe goredis.Pipeliner, hashKey string) []goredis.Cmder {
+	if !s.draining.Load() {
+		return nil
+	}
+	field := drainingPrefix + s.replicaID
+	return []goredis.Cmder{
+		pipe.HSet(ctx, hashKey, field, refreshValue),
+		pipe.HPExpire(ctx, hashKey, s.inflightTTL(), field),
+	}
+}
+
+// StartDrain implements fwkdl.Drainer.
+func (s *RedisSyncer) StartDrain() { s.draining.Store(true) }
+
 // refreshCommands writes and expires this replica's liveness field. Repeating
 // them on every publication tick is what keeps an idle replica live.
 func refreshCommands(ctx context.Context, pipe goredis.Pipeliner, hashKey, replicaID string, ttl time.Duration) []goredis.Cmder {

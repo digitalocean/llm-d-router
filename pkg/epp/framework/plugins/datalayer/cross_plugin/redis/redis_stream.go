@@ -169,7 +169,7 @@ func (s *RedisSyncer) queueStream(ctx context.Context, pipe goredis.Pipeliner, k
 		// The prefix TTL keeps this window readable after this replica departs,
 		// so a liveness field on the in-flight TTL is what tells readers the
 		// replica is still here.
-		cmds = append(cmds, refreshCommands(ctx, pipe, hashKey, s.replicaID, s.inflightTTL())...)
+		cmds = append(cmds, s.livenessCommands(ctx, pipe, hashKey)...)
 		pub.xlen = pipe.XLen(ctx, skey)
 		cmds = append(cmds, pub.xlen)
 	}
@@ -391,7 +391,8 @@ func (s *RedisSyncer) planRead(ctx context.Context, pipe goredis.Pipeliner, key 
 	}
 	markers := map[string]streamMarker{}
 	for _, field := range slices.Sorted(maps.Keys(raw)) {
-		if field == s.replicaID || field == markerField(s.replicaID) {
+		if field == s.replicaID || field == markerField(s.replicaID) ||
+			strings.HasPrefix(field, refreshPrefix) || strings.HasPrefix(field, drainingPrefix) {
 			continue
 		}
 		id, isMarker := strings.CutPrefix(field, markerPrefix)
@@ -573,6 +574,7 @@ func decodeEntries(msgs []goredis.XMessage, from, tip uint64) (uint64, [][]byte,
 func (s *RedisSyncer) storeStreamAggregate(key fwkdl.StateKey, read *streamRead, aggregate func([]any) any) int {
 	hashKey := read.pub.hashKey
 	peers := len(read.next) + len(read.legacy)
+	s.observeReplicas(hashKey, read.pub.result.Val())
 	if peers == 0 {
 		s.storeAggregate(key, hashKey, nil)
 		return 0

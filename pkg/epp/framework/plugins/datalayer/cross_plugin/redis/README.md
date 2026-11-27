@@ -263,8 +263,33 @@ decisions before either observes the other's latest work.
 
 This synchronization does not implement an atomic cluster-wide admission
 quota. Flow control admission across replicas, including fixed per-replica
-shares, is described in
+shares and the `concurrency-detector` dynamic budget, is described in
 [Multiple active replicas](../../../../../flowcontrol/README.md#multiple-active-replicas).
+
+The syncer reports the live replica set to `concurrency-detector` through
+`ReplicaCounter.ActiveReplicas`, so the divided flow-control budget is sized from
+the same heartbeat peers are judged by. It counts the live replicas, this one
+included, using the `refresh:<replica field>` liveness fields described in
+[Peer liveness](#peer-liveness). A retained prefix window from a departed
+replica is not counted, so a long `prefixStateTTL` never inflates the divisor,
+and a hash with no liveness field at all keeps the pre-liveness reading in which
+every replica it names is live. The count is cached and survives a failed
+publication, so an unreachable Valkey leaves each replica on its last share
+instead of widening to the full limit.
+
+The load a divided budget is compared against comes from the in-flight load
+producer, not from the syncer: `LocalInFlightLoadReader.LocalInFlightLoad`
+returns that replica's own counters. The attribute this publisher installs
+carries the aggregate across replicas, which routing scorers keep reading
+unchanged; counting it against a per-replica share would charge peer load to this
+replica and block cluster-wide below the budget.
+
+`redis_syncer_active_peers` and the detector's own
+`llm_d_epp_flow_control_budget_replicas` measure different things and are
+expected to differ by one: `active_peers` excludes this replica and is labeled
+per state key, while `budget_replicas` includes it and is labeled per detector.
+A `budget_replicas` of N therefore corresponds to `active_peers` of N-1 for the
+state key the detector reads.
 
 `GetOrSet` coordinates one value for one request identifier. It does not reserve
 capacity across different requests.
